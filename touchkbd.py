@@ -564,6 +564,10 @@ class Keyboard(Gtk.Window):
         self._mic_btn = Gtk.Button(label="🎤")
         self._mic_btn.connect("clicked", self._mic_toggle)
         nav.pack_start(self._mic_btn, True, True, 0)
+        # copy/paste: plain = ctrl+c/v, with on-screen Shift = ctrl+shift+c/v
+        # (the terminal variant), matching how Shift maps onto the nav keys.
+        nav.pack_start(self._btn("copy", self._copy), True, True, 0)
+        nav.pack_start(self._btn("paste", self._paste), True, True, 0)
         nav.pack_start(self._btn("⌦", None, code=KEYCODE["delete"], repeat=True), True, True, 0)
         nav.pack_start(self._btn("⇞", None, code=KEYCODE["pageup"], repeat=True), True, True, 0)
         nav.pack_start(self._btn("⇟", None, code=KEYCODE["pagedown"], repeat=True), True, True, 0)
@@ -851,6 +855,25 @@ class Keyboard(Gtk.Window):
                 self._set_shift(0)
         else:
             send([(code, 1), (code, 0)])
+
+    def _combo_key(self, code):
+        """ctrl(+shift on armed Shift)+key; Shift consumed like on nav keys."""
+        self._poke()
+        self._reset_word()
+        if self._shift:
+            send([(KEYCODE["ctrl"], 1), (SHIFT, 1), (code, 1), (code, 0),
+                  (SHIFT, 0), (KEYCODE["ctrl"], 0)])
+            if self._shift == 1:
+                self._set_shift(0)
+        else:
+            send([(KEYCODE["ctrl"], 1), (code, 1), (code, 0),
+                  (KEYCODE["ctrl"], 0)])
+
+    def _copy(self, *_):
+        self._combo_key(KEYCODE["c"])
+
+    def _paste(self, *_):
+        self._combo_key(KEYCODE["v"])
 
     # ----- speech to text -----
 
