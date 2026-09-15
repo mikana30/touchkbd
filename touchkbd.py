@@ -956,9 +956,10 @@ class Keyboard(Gtk.Window):
         w, h = self.get_size()
         self.move(self.mon.x, self.mon.y + self.mon.height - h)
         # Reserve the space we occupy so maximized windows resize above us
-        # and the focused input box stays visible -- only while expanded.
-        body = self.stack.get_visible_child_name() == "body"
-        self._set_strut(h if body else 0)
+        # and the focused input box stays visible -- pill included: it is
+        # keep-above, so an unreserved strip under it hides bottom-of-screen
+        # UI (status lines, accept-edits bars).
+        self._set_strut(h)
 
     def _set_strut(self, px):
         """Publish _NET_WM_STRUT_PARTIAL via libX11; Gdk.property_change
