@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+user-words.txt
+touchkbd.log
+mic.wav
+*.bak

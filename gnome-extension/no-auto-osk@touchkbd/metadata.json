@@ -1,0 +1,7 @@
+{
+  "uuid": "no-auto-osk@touchkbd",
+  "name": "No Auto OSK",
+  "description": "Stop GNOME's native on-screen keyboard from auto-showing in touch mode, so touchkbd can be the system keyboard. The a11y screen-keyboard-enabled setting still force-enables the native OSK if ever needed.",
+  "shell-version": ["50"],
+  "version": 1
+}
