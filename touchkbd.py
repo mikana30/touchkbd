@@ -202,9 +202,18 @@ def type_word(word, capitalize=False):
     send(codes)
 
 
+_UNICODE_FOLD = {"’": "'", "‘": "'", "“": '"',
+                 "”": '"', "—": "-", "–": "-",
+                 "…": "..."}
+
+
 def type_text(text):
-    """Inject free-form text (speech transcripts). Chars without a keycode
-    mapping (curly quotes etc.) are dropped rather than mistyped."""
+    """Inject free-form text (speech transcripts). Whisper's curly quotes
+    map to their ASCII forms; anything still unmapped is dropped rather
+    than mistyped. Sent in small paced chunks — one giant burst can lose
+    keystrokes in the receiving app."""
+    for u, a in _UNICODE_FOLD.items():
+        text = text.replace(u, a)
     codes = []
     for ch in text:
         if ch == "\n":
@@ -213,7 +222,9 @@ def type_text(text):
             codes += [(KEYCODE["space"], 1), (KEYCODE["space"], 0)]
         elif ch.lower() in CHARS:
             codes += char_codes(ch.lower(), force_shift=ch.isupper())
-    send(codes)
+    for i in range(0, len(codes), 16):
+        send(codes[i:i + 16])
+        time.sleep(0.01)
 
 
 def resample(pts, n=RESAMPLE):
@@ -1294,8 +1305,12 @@ class Keyboard(Gtk.Window):
                 from faster_whisper import WhisperModel
                 _WHISPER = WhisperModel("base.en", device="cpu",
                                         compute_type="int8", cpu_threads=4)
-            segs, _info = _WHISPER.transcribe(MIC_WAV, beam_size=1,
-                                              language="en")
+            segs, _info = _WHISPER.transcribe(
+                MIC_WAV, beam_size=5, language="en",
+                condition_on_previous_text=False,
+                initial_prompt="Claude Code terminal commands on a Fedora "
+                               "Surface Go tablet: keyboard, touchscreen, "
+                               "mouse pointer, copy, paste, drag, select.")
             text = "".join(s.text for s in segs).strip()
         except Exception as e:
             print("mic: transcribe failed: %r" % e, flush=True)
