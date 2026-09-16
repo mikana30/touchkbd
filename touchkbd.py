@@ -470,7 +470,9 @@ class Predictor:
         for w in cands:
             c = self._cost(typed, w)
             if c is not None:
-                scored.append((c + math.log10(self.rank[w] + 10) / 4.0, w))
+                # freq prior kept weak: it was letting common words (work,
+                # world) beat the intended rarer word (worked) on typos
+                scored.append((c + math.log10(self.rank[w] + 10) / 6.0, w))
         scored.sort()
         return scored[:4]
 
@@ -1197,7 +1199,13 @@ class Keyboard(Gtk.Window):
             self._set_suggestions([])
             return
         cands = self.predictor.correct(buf)
-        if cands and cands[0][0] <= AUTOCORRECT_MAX:
+        # auto-replace only when it's a clear win: 4+ letters (3-letter
+        # "fixes" like ssh->ash were mostly wrong) and no near-tie between
+        # candidates (workd: work/world/worked all score close — suggest,
+        # don't guess)
+        if (cands and cands[0][0] <= AUTOCORRECT_MAX and len(buf) >= 4
+                and (len(cands) == 1
+                     or cands[1][0] - cands[0][0] >= 0.20)):
             corr = cands[0][1]
             send([(KEYCODE["bksp"], s) for _ in buf for s in (1, 0)])
             type_word(corr, capitalize=cap)
