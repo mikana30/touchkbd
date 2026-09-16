@@ -14,8 +14,8 @@ On-screen Shift also applies to tab/enter/arrows (shift+tab cycles Claude
 Code permission modes). Collapses to a bottom-edge pill with scroll keys;
 auto-collapses after 20s idle.
 """
-import bisect, ctypes, ctypes.util, math, os, socket, struct, subprocess, sys
-import threading, time
+import bisect, ctypes, ctypes.util, fcntl, math, os, socket, struct
+import subprocess, sys, threading, time
 os.environ["GDK_BACKEND"] = "x11"
 import gi
 gi.require_version("Gtk", "3.0")
@@ -123,6 +123,63 @@ class Injector:
 
 
 INJ = Injector(SOCKET)
+
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+MOUSE_GAIN = 1.2
+
+
+class VirtualMouse:
+    """Transient uinput pointer for mouse mode (terminal text selection —
+    VTE has no touch selection at all; long-press only opens its menu).
+    The device must NOT outlive the mode: a persistent pointer makes
+    Mutter drop touch-mode, which kills auto-rotation. /dev/uinput access
+    comes from the uaccess udev rule in /etc/udev/rules.d/."""
+
+    UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
+    UI_SET_RELBIT = 0x40045566
+    UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
+
+    def __init__(self):
+        self.fd = os.open("/dev/uinput",
+                          os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        for ev in (1, 2, 0):  # EV_KEY, EV_REL, EV_SYN
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, ev)
+        for b in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE):
+            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, b)
+        for r in (0, 1):  # REL_X, REL_Y
+            fcntl.ioctl(self.fd, self.UI_SET_RELBIT, r)
+        os.write(self.fd, struct.pack("80sHHHHi", b"touchkbd pointer",
+                                      0x06, 0x2333, 0x6667, 1, 0)
+                 + b"\0" * 1024)
+        fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+        self.held = False
+
+    def _emit(self, t, c, v):
+        os.write(self.fd, struct.pack("llHHi", 0, 0, t, c, v))
+
+    def move(self, dx, dy):
+        if dx:
+            self._emit(2, 0, dx)
+        if dy:
+            self._emit(2, 1, dy)
+        self._emit(0, 0, 0)
+
+    def button(self, btn, val):
+        self._emit(1, btn, val)
+        self._emit(0, 0, 0)
+        if btn == BTN_LEFT:
+            self.held = bool(val)
+
+    def click(self, btn=BTN_LEFT, times=1):
+        for _ in range(times):
+            self.button(btn, 1)
+            self.button(btn, 0)
+
+    def close(self):
+        if self.held:
+            self.button(BTN_LEFT, 0)
+        fcntl.ioctl(self.fd, self.UI_DEV_DESTROY)
+        os.close(self.fd)
 
 
 def send(codes):
@@ -451,6 +508,15 @@ class Keyboard(Gtk.Window):
         self._sugg_action = None
         self._rec_proc = None
         self._transcribing = False
+        self.mouse = None
+        self._pad_last = None
+        self._pad_seq = None
+        self._drag_pending = False
+        self._drag_l_up = False
+        self._drag_acc = [0, 0]
+        self._pad_start = (0.0, 0.0, 0.0)
+        self._pad_moved = 0.0
+        self._pad_rx = self._pad_ry = 0.0
 
         self._layout_cache = {}
         for name in LAYOUTS:
@@ -467,6 +533,7 @@ class Keyboard(Gtk.Window):
         self.stack.set_hhomogeneous(False)
         self.stack.set_vhomogeneous(False)
         self.stack.add_named(self._build_body(), "body")
+        self.stack.add_named(self._build_mouse(), "mouse")
         self.stack.add_named(self._build_pill(), "pill")
         self.add(self.stack)
 
@@ -568,6 +635,7 @@ class Keyboard(Gtk.Window):
         # (the terminal variant), matching how Shift maps onto the nav keys.
         nav.pack_start(self._btn("copy", self._copy), True, True, 0)
         nav.pack_start(self._btn("paste", self._paste), True, True, 0)
+        nav.pack_start(self._btn("🖱", self._mouse_toggle), True, True, 0)
         nav.pack_start(self._btn("⌦", None, code=KEYCODE["delete"], repeat=True), True, True, 0)
         nav.pack_start(self._btn("⇞", None, code=KEYCODE["pageup"], repeat=True), True, True, 0)
         nav.pack_start(self._btn("⇟", None, code=KEYCODE["pagedown"], repeat=True), True, True, 0)
@@ -577,6 +645,288 @@ class Keyboard(Gtk.Window):
             nav.pack_start(self._btn(lbl, None, code=code, repeat=True), True, True, 0)
         v.pack_start(nav, False, False, 0)
         return v
+
+    def _build_mouse(self):
+        v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        v.get_style_context().add_class("kbd")
+        v.set_border_width(3)
+        self.pad = Gtk.DrawingArea()
+        self.pad.set_size_request(self.mon.width, self.canvas_h + 43)
+        # Touch events, not emulated pointer events: the drag button is
+        # held by one finger while a second strokes the pad, and only the
+        # first touch sequence gets pointer emulation.
+        self.pad.add_events(Gdk.EventMask.BUTTON_PRESS_MASK |
+                            Gdk.EventMask.BUTTON_RELEASE_MASK |
+                            Gdk.EventMask.POINTER_MOTION_MASK |
+                            Gdk.EventMask.TOUCH_MASK)
+        self.pad.connect("draw", self._pad_draw)
+        self.pad.connect("touch-event", self._pad_touch)
+        self.pad.connect("button-press-event", self._pad_press)
+        self.pad.connect("motion-notify-event", self._pad_motion)
+        self.pad.connect("button-release-event", self._pad_release)
+        v.pack_start(self.pad, False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=3)
+        # L/R are touch-native areas, NOT GtkButtons: a GtkButton touch goes
+        # through pointer emulation, which WARPS the pointer to the button —
+        # the drag anchor landed on the keyboard instead of the target text.
+        self._lbtn = self._mouse_btn("L  (hold = drag)", self._drag_set)
+        row.pack_start(self._lbtn, True, True, 0)
+        self._rbtn = self._mouse_btn("R", self._rclick_set)
+        row.pack_start(self._rbtn, True, True, 0)
+        self._mbtn_paste = self._mouse_btn("M paste", self._mclick_set)
+        row.pack_start(self._mbtn_paste, True, True, 0)
+        row.pack_start(self._btn("⌨ back", self._mouse_exit), True, True, 0)
+        v.pack_start(row, False, False, 0)
+        return v
+
+    def _mouse_btn(self, label, setter):
+        da = Gtk.DrawingArea()
+        da.set_size_request(-1, 44)
+        # touch events only arrive when the button masks are selected too
+        da.add_events(Gdk.EventMask.TOUCH_MASK |
+                      Gdk.EventMask.BUTTON_PRESS_MASK |
+                      Gdk.EventMask.BUTTON_RELEASE_MASK)
+        da._label, da._down = label, False
+        da.connect("draw", self._mouse_btn_draw)
+        da.connect("touch-event", self._mouse_btn_touch, setter)
+        return da
+
+    def _mouse_btn_draw(self, w, cr):
+        a = w.get_allocation()
+        col = (0.47, 0.47, 0.78, 1) if w._down else (0.17, 0.17, 0.22, 1)
+        cr.set_source_rgba(*col)
+        self._round_rect(cr, 2, 2, a.width - 4, a.height - 4, 7)
+        cr.fill()
+        cr.set_source_rgba(0.94, 0.94, 0.96, 1)
+        cr.set_font_size(15)
+        ext = cr.text_extents(w._label)
+        cr.move_to(a.width / 2 - ext.width / 2, a.height / 2 + ext.height / 2)
+        cr.show_text(w._label)
+        return False
+
+    def _mouse_btn_touch(self, w, ev, setter):
+        t = ev.type
+        if t == Gdk.EventType.TOUCH_BEGIN:
+            self._poke()
+            if self.mouse and not w._down:
+                w._down = True
+                setter(True)
+                w.queue_draw()
+        elif t in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
+            if w._down:
+                w._down = False
+                if self.mouse:
+                    setter(False)
+                w.queue_draw()
+        return True
+
+    def _rclick_set(self, on):
+        # deferred for the same reason as the pad tap-click
+        if not on:
+            GLib.timeout_add(250, self._deferred_click, BTN_RIGHT)
+
+    def _mclick_set(self, on):
+        # middle-click pastes the PRIMARY selection (what L-drag selected);
+        # shift-wrapped so it pastes even under TUI mouse reporting
+        if not on:
+            GLib.timeout_add(400, self._deferred_mpaste)
+
+    def _deferred_mpaste(self):
+        if self.mouse:
+            self._wiggle()
+            send([(SHIFT, 1)])
+            self.mouse.click(BTN_MIDDLE)
+            send([(SHIFT, 0)])
+        return False
+
+    # ----- mouse mode -----
+
+    def _mouse_toggle(self, *_):
+        self._poke()
+        if self.mouse:
+            return self._mouse_exit()
+        try:
+            self.mouse = VirtualMouse()
+        except OSError as e:
+            print("mouse: /dev/uinput failed: %s" % e, flush=True)
+            return
+        self._pad_last = None
+        self.stack.set_visible_child_name("mouse")
+
+    def _mouse_exit(self, *_):
+        self._poke()
+        self._mouse_teardown()
+        self.stack.set_visible_child_name("body")
+
+    def _mouse_teardown(self):
+        self._drag_pending = self._drag_l_up = False
+        if self.mouse:
+            if self.mouse.held:
+                send([(SHIFT, 0)])  # a replay may have shift down
+            self.mouse.close()      # releases any held button
+            self.mouse = None
+            for w in (self._lbtn, self._rbtn, self._mbtn_paste):
+                w._down = False
+                w.queue_draw()
+
+    def _mouse_do(self, fn):
+        self._poke()
+        if self.mouse:
+            fn(self.mouse)
+
+    def _drag_set(self, on):
+        # The drag can't run while a finger is on the screen: active touch
+        # steals pointer delivery from the target window (verified — the
+        # same event stream selects fine with no touch down). So holding L
+        # only RECORDS the sweep; _drag_replay re-executes it after both
+        # fingers lift. Needs flat accel-profile so deltas replay exactly.
+        if on:
+            self._drag_pending = True
+            self._drag_l_up = False
+            self._drag_acc = [0, 0]
+        else:
+            self._drag_l_up = True
+            self._maybe_replay()
+
+    def _maybe_replay(self):
+        if not (self._drag_pending and self._drag_l_up):
+            return
+        if self._pad_seq is not None:  # sweep finger still down
+            return
+        self._drag_pending = False
+        self._drag_l_up = False
+        ax, ay = self._drag_acc
+        GLib.timeout_add(300, self._drag_replay, ax, ay)
+
+    def _drag_replay(self, ax, ay):
+        if not self.mouse:
+            return False
+        print("mouse: replay %d,%d" % (ax, ay), flush=True)
+        m = self.mouse
+        if ax == 0 and ay == 0:
+            m.click()
+            return False
+        # Shift+drag, not plain drag: TUIs (Claude Code) turn on mouse
+        # reporting, which swallows plain drags; Shift forces VTE's own
+        # selection layer in both cases.
+        send([(SHIFT, 1)])
+        m.move(-ax, -ay)  # rewind to the anchor
+        time.sleep(0.06)
+        m.button(BTN_LEFT, 1)
+        time.sleep(0.06)
+        steps, fx, fy = 16, 0, 0
+        for i in range(1, steps + 1):
+            tx, ty = ax * i // steps, ay * i // steps
+            m.move(tx - fx, ty - fy)
+            fx, fy = tx, ty
+            time.sleep(0.015)
+        time.sleep(0.06)
+        m.button(BTN_LEFT, 0)
+        send([(SHIFT, 0)])
+        return False
+
+    def _deferred_click(self, btn):
+        if self.mouse:
+            self._wiggle()
+            self.mouse.click(btn)
+        return False
+
+    def _wiggle(self):
+        # 1px out-and-back: after touch input the pointer's presence over
+        # the window is stale, and the first click only re-establishes it —
+        # a tiny move forces the compositor to re-deliver pointer focus
+        self.mouse.move(1, 0)
+        time.sleep(0.05)
+        self.mouse.move(-1, 0)
+        time.sleep(0.08)
+
+    def _pad_draw(self, _w, cr):
+        cr.set_source_rgba(0.06, 0.06, 0.08, 1)
+        cr.paint()
+        a = self.pad.get_allocation()
+        cr.set_source_rgba(0.13, 0.13, 0.17, 1)
+        self._round_rect(cr, 6, 6, a.width - 12, a.height - 12, 10)
+        cr.fill()
+        cr.set_source_rgba(0.45, 0.45, 0.52, 1)
+        cr.set_font_size(15)
+        for i, line in enumerate(
+                ("trackpad — drag to move, tap to click",
+                 "select: HOLD the drag key + sweep here with another finger")):
+            ext = cr.text_extents(line)
+            cr.move_to(a.width / 2 - ext.width / 2,
+                       a.height / 2 + i * 26 - 8)
+            cr.show_text(line)
+        return False
+
+    def _pad_begin(self, x, y):
+        self._poke()
+        self._pad_last = (x, y)
+        self._pad_start = (x, y, time.time())
+        self._pad_moved = 0.0
+        self._pad_rx = self._pad_ry = 0.0
+
+    def _pad_move(self, x, y):
+        if self._pad_last is None or not self.mouse:
+            return
+        dx, dy = x - self._pad_last[0], y - self._pad_last[1]
+        self._pad_last = (x, y)
+        self._pad_moved += abs(dx) + abs(dy)
+        self._pad_rx += dx * MOUSE_GAIN
+        self._pad_ry += dy * MOUSE_GAIN
+        mx, my = int(self._pad_rx), int(self._pad_ry)
+        self._pad_rx -= mx
+        self._pad_ry -= my
+        if mx or my:
+            self.mouse.move(mx, my)
+            if self._drag_pending:
+                self._drag_acc[0] += mx
+                self._drag_acc[1] += my
+
+    def _pad_end(self):
+        if self._pad_last is None:
+            return
+        _x0, _y0, t0 = self._pad_start
+        self._pad_last = None
+        if self._drag_pending or self._drag_l_up:
+            self._maybe_replay()
+            return
+        # deferred so the click fires with no finger on the screen —
+        # active touch steals pointer delivery from the target window
+        if (self.mouse and self._pad_moved <= TAP_SLOP
+                and time.time() - t0 < 0.4):
+            GLib.timeout_add(250, self._deferred_click, BTN_LEFT)
+
+    def _pad_touch(self, _w, ev):
+        t = ev.type
+        if t == Gdk.EventType.TOUCH_BEGIN:
+            if self._pad_seq is None:
+                self._pad_seq = ev.touch.sequence
+                self._pad_begin(ev.touch.x, ev.touch.y)
+        elif t == Gdk.EventType.TOUCH_UPDATE:
+            if ev.touch.sequence == self._pad_seq:
+                self._pad_move(ev.touch.x, ev.touch.y)
+        elif t in (Gdk.EventType.TOUCH_END, Gdk.EventType.TOUCH_CANCEL):
+            if ev.touch.sequence == self._pad_seq:
+                self._pad_seq = None
+                self._pad_end()
+        return True
+
+    # pointer-event fallbacks (real mouse); touches are handled above, so
+    # skip the pointer events GDK synthesizes from the primary touch
+    def _pad_press(self, _w, ev):
+        if not ev.get_pointer_emulated():
+            self._pad_begin(ev.x, ev.y)
+        return True
+
+    def _pad_motion(self, _w, ev):
+        if not ev.get_pointer_emulated() and self._pad_seq is None:
+            self._pad_move(ev.x, ev.y)
+        return True
+
+    def _pad_release(self, _w, ev):
+        if not ev.get_pointer_emulated() and self._pad_seq is None:
+            self._pad_end()
+        return True
 
     def _build_pill(self):
         h = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
@@ -972,6 +1322,7 @@ class Keyboard(Gtk.Window):
         if self._idle_timer:
             GLib.source_remove(self._idle_timer)
             self._idle_timer = None
+        self._mouse_teardown()
         self.stack.set_visible_child_name("pill")
         self.resize(self.mon.width, 1)
 
