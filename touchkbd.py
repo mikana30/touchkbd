@@ -809,9 +809,13 @@ class Keyboard(Gtk.Window):
         # Shift+drag, not plain drag: TUIs (Claude Code) turn on mouse
         # reporting, which swallows plain drags; Shift forces VTE's own
         # selection layer in both cases.
-        send([(SHIFT, 1)])
         m.move(-ax, -ay)  # rewind to the anchor
         time.sleep(0.06)
+        # plain click first: at a plain prompt shift+drag EXTENDS any old
+        # selection instead of starting one — the click clears it
+        m.click()
+        time.sleep(0.12)
+        send([(SHIFT, 1)])
         m.button(BTN_LEFT, 1)
         time.sleep(0.06)
         steps, fx, fy = 16, 0, 0
@@ -823,7 +827,23 @@ class Keyboard(Gtk.Window):
         time.sleep(0.06)
         m.button(BTN_LEFT, 0)
         send([(SHIFT, 0)])
+        # promote the fresh PRIMARY selection to the CLIPBOARD so the
+        # normal paste key works everywhere (VTE middle-click self-paste
+        # is unreliable)
+        GLib.timeout_add(250, self._sel_to_clipboard)
         return False
+
+    def _sel_to_clipboard(self):
+        Gtk.Clipboard.get(Gdk.SELECTION_PRIMARY).request_text(
+            self._sel_got, None)
+        return False
+
+    def _sel_got(self, _cb, text, _data):
+        if text:
+            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+            print("mouse: clipboard <- %d chars" % len(text), flush=True)
+        else:
+            print("mouse: clipboard promote: no primary text", flush=True)
 
     def _deferred_click(self, btn):
         if self.mouse:
