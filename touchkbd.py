@@ -14,7 +14,7 @@ On-screen Shift also applies to tab/enter/arrows (shift+tab cycles Claude
 Code permission modes). Collapses to a bottom-edge pill with scroll keys;
 auto-collapses after 20s idle.
 """
-import bisect, ctypes, ctypes.util, fcntl, math, os, socket, struct
+import bisect, ctypes, ctypes.util, fcntl, glob, math, os, socket, struct
 import subprocess, sys, threading, time
 os.environ["GDK_BACKEND"] = "x11"
 import gi
@@ -27,6 +27,7 @@ SOCKET = os.environ.get("YDOTOOL_SOCKET",
 WORDS = os.path.expanduser("~/.local/share/touchkbd/words.txt")
 USER_WORDS = os.path.expanduser("~/.local/share/touchkbd/user-words.txt")
 SHIFT = 42
+KEY_CAPSLOCK = 58
 REPEAT_DELAY, REPEAT_MS = 420, 90
 RESAMPLE = 24
 TAP_SLOP = 26
@@ -509,6 +510,13 @@ class Keyboard(Gtk.Window):
         self.key_h = 48
         self._screen = "letters"
         self._shift = 0
+        # System Caps Lock (separate from our Shift lock). Read from the
+        # kernel LED: GDK's keymap state never updates for an unfocused
+        # Xwayland dock, but mutter mirrors xkb lock state to the LEDs.
+        self._caps_led = next(iter(glob.glob(
+            "/sys/class/leds/*capslock/brightness")), None)
+        self._sys_caps = False
+        GLib.timeout_add(500, self._poll_caps)
         self._timer = None
         self._idle_timer = None
         self._trail_timeout = None
@@ -1006,13 +1014,15 @@ class Keyboard(Gtk.Window):
     def _draw(self, _w, cr):
         cr.set_source_rgba(0.06, 0.06, 0.08, 1)
         cr.paint()
-        up = bool(self._shift) and self._screen == "letters"
+        up = (bool(self._shift) != self._sys_caps) and self._screen == "letters"
         for kid, x, y, w, h, label in self.keys:
             pressed = (kid == self._down_key and self._down)
             if kid == "SHIFT" and self._shift:
                 pressed = True
             special = not (len(kid) == 1)
-            if pressed:
+            if kid == "SHIFT" and self._sys_caps:
+                col = (0.78, 0.22, 0.22, 1)      # system Caps Lock latched
+            elif pressed:
                 col = (0.47, 0.47, 0.78, 1)
             elif special:
                 col = (0.17, 0.17, 0.22, 1)
@@ -1022,7 +1032,10 @@ class Keyboard(Gtk.Window):
             self._round_rect(cr, x + 2, y + 2, w - 4, h - 4, 7)
             cr.fill()
             if kid == "SHIFT":
-                label = "SHIFT" if self._shift == 2 else "Shift"
+                if self._sys_caps:
+                    label = "CAPS"
+                else:
+                    label = "SHIFT" if self._shift == 2 else "Shift"
             elif kid == "SPACE":
                 cr.set_source_rgba(0.55, 0.55, 0.60, 1)
                 cr.rectangle(x + w * 0.25, y + h / 2 - 2, w * 0.5, 4)
@@ -1117,7 +1130,14 @@ class Keyboard(Gtk.Window):
         if kid is None:
             return
         if kid == "SHIFT":
-            self._set_shift((self._shift + 1) % 3)
+            if self._sys_caps:
+                # Tap on the red CAPS badge releases the system Caps Lock
+                # (a real keycode-58 press); our own Shift state is untouched.
+                send([(KEY_CAPSLOCK, 1), (KEY_CAPSLOCK, 0)])
+                self._sys_caps = False
+                self.canvas.queue_draw()
+            else:
+                self._set_shift((self._shift + 1) % 3)
         elif kid == "BKSP":
             pass                        # fired on press
         elif kid == "SPACE":
@@ -1163,6 +1183,22 @@ class Keyboard(Gtk.Window):
         self._set_suggestions([word], mark=word)
 
     # ----- tap-typing prediction / autocorrect -----
+
+    def _poll_caps(self):
+        on = False
+        if self._caps_led:
+            try:
+                with open(self._caps_led) as f:
+                    on = f.read().strip() == "1"
+            except OSError:
+                pass
+        if on != self._sys_caps:
+            self._sys_caps = on
+            sys.stderr.write("%s system caps lock %s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), "ON" if on else "off"))
+            sys.stderr.flush()
+            self.canvas.queue_draw()
+        return True
 
     def _set_shift(self, v):
         self._shift = v
