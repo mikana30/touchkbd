@@ -1012,10 +1012,10 @@ class Keyboard(Gtk.Window):
         cb.set_size_request(PILL_KEY_W, -1)
         cb.connect("clicked", lambda _b: self._slash("claude"))
         h.pack_start(cb, False, False, 0)
-        tb = Gtk.Button(label="BLS")
+        tb = Gtk.Button(label="bls")
         tb.get_style_context().add_class("pill")
         tb.set_size_request(PILL_KEY_W, -1)
-        tb.connect("clicked", lambda _b: type_text("BLS"))
+        tb.connect("clicked", lambda _b: type_text("bls"))
         h.pack_start(tb, False, False, 0)
         return h
 
