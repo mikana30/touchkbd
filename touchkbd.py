@@ -649,9 +649,8 @@ class Keyboard(Gtk.Window):
         nav.pack_start(self._btn("esc", lambda *_: self._tap(KEYCODE["esc"])), True, True, 0)
         self._tab_btn = self._btn("tab", lambda *_: self._tap(KEYCODE["tab"]))
         nav.pack_start(self._tab_btn, True, True, 0)
-        self._mic_btn = Gtk.Button(label="🎤")
-        self._mic_btn.connect("clicked", self._mic_toggle)
-        nav.pack_start(self._mic_btn, True, True, 0)
+        self._mic_btns = []
+        nav.pack_start(self._new_mic_btn(), True, True, 0)
         # copy/paste: plain = ctrl+c/v, with on-screen Shift = ctrl+shift+c/v
         # (the terminal variant), matching how Shift maps onto the nav keys.
         nav.pack_start(self._btn("copy", self._copy), True, True, 0)
@@ -983,7 +982,34 @@ class Keyboard(Gtk.Window):
             sb.connect("released", self._stop_repeat)
             sb.connect("leave", self._stop_repeat)
             h.pack_end(sb, False, False, 0)
+        # tab / enter / mic usable without expanding the keyboard
+        for lbl, code in (("⏎", KEYCODE["enter"]), ("tab", KEYCODE["tab"])):
+            kb = Gtk.Button(label=lbl)
+            kb.get_style_context().add_class("pill")
+            kb.set_size_request(52, -1)
+            kb.connect("clicked", lambda _b, c=code: self._tap(c))
+            h.pack_end(kb, False, False, 0)
+        mb = self._new_mic_btn()
+        mb.get_style_context().add_class("pill")
+        mb.set_size_request(52, -1)
+        h.pack_end(mb, False, False, 0)
         return h
+
+    def _new_mic_btn(self):
+        """All mic buttons (nav row + pill) share one recording state."""
+        b = Gtk.Button(label="🎤")
+        b.connect("clicked", self._mic_toggle)
+        self._mic_btns.append(b)
+        return b
+
+    def _set_mic_label(self, label, rec=False):
+        for b in self._mic_btns:
+            b.set_label(label)
+            ctx = b.get_style_context()
+            if rec:
+                ctx.add_class("rec")
+            else:
+                ctx.remove_class("rec")
 
     def _btn(self, label, cb, code=None, repeat=False):
         b = Gtk.Button(label=label)
@@ -1313,8 +1339,7 @@ class Keyboard(Gtk.Window):
             except OSError as e:
                 print("mic: pw-record failed: %s" % e, flush=True)
                 return
-            self._mic_btn.set_label("◉ stop")
-            self._mic_btn.get_style_context().add_class("rec")
+            self._set_mic_label("◉ stop", rec=True)
             # don't auto-collapse mid-recording: the stop button would vanish
             if self._idle_timer:
                 GLib.source_remove(self._idle_timer)
@@ -1328,8 +1353,7 @@ class Keyboard(Gtk.Window):
                 p.kill()
                 p.wait()
             self._transcribing = True
-            self._mic_btn.set_label("…")
-            self._mic_btn.get_style_context().remove_class("rec")
+            self._set_mic_label("…")
             threading.Thread(target=self._transcribe, daemon=True).start()
 
     def _transcribe(self):
@@ -1354,7 +1378,7 @@ class Keyboard(Gtk.Window):
 
     def _mic_done(self, text):
         self._transcribing = False
-        self._mic_btn.set_label("🎤")
+        self._set_mic_label("🎤")
         if text:
             print("mic: %r" % text, flush=True)
             type_text(text + " ")
