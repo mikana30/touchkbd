@@ -33,6 +33,7 @@ RESAMPLE = 24
 TAP_SLOP = 26
 FREQ_W = 3.5
 IDLE_S = 20
+PILL_KEY_W = 90         # collapsed-bar key width (logical px)
 
 KEYCODE = {c: i for i, c in enumerate(
     ["", "esc", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=",
@@ -977,7 +978,7 @@ class Keyboard(Gtk.Window):
         for lbl, code in (("⇟", KEYCODE["pagedown"]), ("⇞", KEYCODE["pageup"])):
             sb = Gtk.Button(label=lbl)
             sb.get_style_context().add_class("pill")
-            sb.set_size_request(52, -1)
+            sb.set_size_request(PILL_KEY_W, -1)
             sb.connect("pressed", self._press_repeat, code)
             sb.connect("released", self._stop_repeat)
             sb.connect("leave", self._stop_repeat)
@@ -986,12 +987,12 @@ class Keyboard(Gtk.Window):
         for lbl, code in (("⏎", KEYCODE["enter"]), ("tab", KEYCODE["tab"])):
             kb = Gtk.Button(label=lbl)
             kb.get_style_context().add_class("pill")
-            kb.set_size_request(52, -1)
+            kb.set_size_request(PILL_KEY_W, -1)
             kb.connect("clicked", lambda _b, c=code: self._tap(c))
             h.pack_end(kb, False, False, 0)
         mb = self._new_mic_btn()
         mb.get_style_context().add_class("pill")
-        mb.set_size_request(52, -1)
+        mb.set_size_request(PILL_KEY_W, -1)
         h.pack_end(mb, False, False, 0)
         return h
 
