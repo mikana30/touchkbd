@@ -1007,6 +1007,16 @@ class Keyboard(Gtk.Window):
         self._clear_btn.connect("clicked", self._clear_tap)
         h.pack_start(self._clear_btn, False, False, 0)
         self._clear_armed = None
+        cb = Gtk.Button(label="claude")
+        cb.get_style_context().add_class("pill")
+        cb.set_size_request(PILL_KEY_W, -1)
+        cb.connect("clicked", lambda _b: self._slash("claude"))
+        h.pack_start(cb, False, False, 0)
+        tb = Gtk.Button(label="BLS")
+        tb.get_style_context().add_class("pill")
+        tb.set_size_request(PILL_KEY_W, -1)
+        tb.connect("clicked", lambda _b: type_text("BLS"))
+        h.pack_start(tb, False, False, 0)
         return h
 
     def _slash(self, cmd):
