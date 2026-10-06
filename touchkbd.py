@@ -994,7 +994,41 @@ class Keyboard(Gtk.Window):
         mb.get_style_context().add_class("pill")
         mb.set_size_request(PILL_KEY_W, -1)
         h.pack_end(mb, False, False, 0)
+        # Claude Code slash commands, on the far left away from the keys
+        # above. /clear wipes the session, so it takes a second tap.
+        hb = Gtk.Button(label="handoff")
+        hb.get_style_context().add_class("pill")
+        hb.set_size_request(PILL_KEY_W, -1)
+        hb.connect("clicked", lambda _b: self._slash("/handoff"))
+        h.pack_start(hb, False, False, 0)
+        self._clear_btn = Gtk.Button(label="clear")
+        self._clear_btn.get_style_context().add_class("pill")
+        self._clear_btn.set_size_request(PILL_KEY_W, -1)
+        self._clear_btn.connect("clicked", self._clear_tap)
+        h.pack_start(self._clear_btn, False, False, 0)
+        self._clear_armed = None
         return h
+
+    def _slash(self, cmd):
+        type_text(cmd)
+        # let Claude Code's command menu settle before submitting
+        GLib.timeout_add(250, lambda: self._tap(KEYCODE["enter"]) and False)
+
+    def _clear_tap(self, _b):
+        if self._clear_armed:
+            GLib.source_remove(self._clear_armed)
+            self._clear_disarm()
+            self._slash("/clear")
+            return
+        self._clear_btn.set_label("clear?")
+        self._clear_btn.get_style_context().add_class("rec")
+        self._clear_armed = GLib.timeout_add_seconds(3, self._clear_disarm)
+
+    def _clear_disarm(self):
+        self._clear_armed = None
+        self._clear_btn.set_label("clear")
+        self._clear_btn.get_style_context().remove_class("rec")
+        return False
 
     def _new_mic_btn(self):
         """All mic buttons (nav row + pill) share one recording state."""
