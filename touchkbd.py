@@ -1017,7 +1017,23 @@ class Keyboard(Gtk.Window):
         tb.set_size_request(PILL_KEY_W, -1)
         tb.connect("clicked", lambda _b: type_text("bls"))
         h.pack_start(tb, False, False, 0)
+        # landscape only: portrait has no room for another key
+        if self.mon.width > self.mon.height:
+            fb = Gtk.Button(label="touchpad")
+            fb.get_style_context().add_class("pill")
+            fb.set_size_request(PILL_KEY_W, -1)
+            fb.connect("clicked", self._touchpad_fix)
+            h.pack_start(fb, False, False, 0)
         return h
+
+    def _touchpad_fix(self, b):
+        """Log the dead-touchpad state and re-plug the Type Cover
+        (~/bin/touchpad-fix -> touchpad-fix.service, surfacego-config)."""
+        if b.get_label() != "touchpad":
+            return
+        subprocess.Popen([os.path.expanduser("~/bin/touchpad-fix")])
+        b.set_label("fixing…")
+        GLib.timeout_add(4000, lambda: b.set_label("touchpad") and False)
 
     def _slash(self, cmd):
         type_text(cmd)
