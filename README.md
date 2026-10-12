@@ -87,10 +87,16 @@ Run `./touchkbd.py --test` for a quick offline check of the swipe decoder.
   the code handles the logical→physical conversion.
 - The swipe decoder, autocorrect thresholds, and layout are all in one
   readable Python file — tune to taste.
-- `words.txt` is [google-10000-english](https://github.com/first20hours/google-10000-english)
-  (derived from the Google Trillion Word Corpus).
+- `words.txt` merges [google-10000-english](https://github.com/first20hours/google-10000-english)
+  with [FrequencyWords](https://github.com/hermitdave/FrequencyWords) en_50k
+  (OpenSubtitles 2018, CC-BY-SA), filtered through hunspell en_US and ranked
+  by the better of the two ranks. Swipe uses the top 10k only (speed).
+- Autocorrect never touches a word hunspell accepts (needs `hunspell` +
+  `hunspell-en-US`).
 - Personal dictionary lives at `~/.local/share/touchkbd/user-words.txt`,
-  one word per line.
+  one word per line; learned usage (dictionary-word counts, word pairs,
+  undone corrections) in `usage.json`. Non-dictionary words are only
+  learned on an explicit tap, so passwords never land on disk.
 
 ## License
 
