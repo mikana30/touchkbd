@@ -851,6 +851,12 @@ class Keyboard(Gtk.Window):
         row.pack_start(self._rbtn, True, True, 0)
         self._mbtn_paste = self._mouse_btn("M paste", self._mclick_set)
         row.pack_start(self._mbtn_paste, True, True, 0)
+        # Ctrl latch: the next tap-click goes out as Ctrl+click — Ptyxis
+        # opens links only on Ctrl+click (its capture-phase handler runs
+        # before VTE, so this works under TUI mouse reporting too)
+        self._cbtn = self._mouse_btn("Ctrl  (link)", self._ctrl_set)
+        self._cbtn._latched = False
+        row.pack_start(self._cbtn, True, True, 0)
         row.pack_start(self._btn("⌨ back", self._mouse_exit), True, True, 0)
         v.pack_start(row, False, False, 0)
         return v
@@ -869,7 +875,8 @@ class Keyboard(Gtk.Window):
 
     def _mouse_btn_draw(self, w, cr):
         a = w.get_allocation()
-        col = (0.47, 0.47, 0.78, 1) if w._down else (0.17, 0.17, 0.22, 1)
+        on = w._down or getattr(w, "_latched", False)
+        col = (0.47, 0.47, 0.78, 1) if on else (0.17, 0.17, 0.22, 1)
         cr.set_source_rgba(*col)
         self._round_rect(cr, 2, 2, a.width - 4, a.height - 4, 7)
         cr.fill()
@@ -900,6 +907,12 @@ class Keyboard(Gtk.Window):
         # deferred for the same reason as the pad tap-click
         if not on:
             GLib.timeout_add(250, self._deferred_click, BTN_RIGHT)
+
+    def _ctrl_set(self, on):
+        if on:
+            self._cbtn._latched = not self._cbtn._latched
+            print("mouse: ctrl %s" % ("armed" if self._cbtn._latched
+                                      else "off"), flush=True)
 
     def _mclick_set(self, on):
         # middle-click pastes the PRIMARY selection (what L-drag selected);
@@ -942,7 +955,8 @@ class Keyboard(Gtk.Window):
                 send([(SHIFT, 0)])  # a replay may have shift down
             self.mouse.close()      # releases any held button
             self.mouse = None
-            for w in (self._lbtn, self._rbtn, self._mbtn_paste):
+            self._cbtn._latched = False
+            for w in (self._lbtn, self._rbtn, self._mbtn_paste, self._cbtn):
                 w._down = False
                 w.queue_draw()
 
@@ -1025,7 +1039,17 @@ class Keyboard(Gtk.Window):
     def _deferred_click(self, btn):
         if self.mouse:
             self._wiggle()
-            self.mouse.click(btn)
+            if btn == BTN_LEFT and self._cbtn._latched:
+                self._cbtn._latched = False   # one-shot
+                self._cbtn.queue_draw()
+                print("mouse: ctrl+click", flush=True)
+                send([(KEYCODE["ctrl"], 1)])
+                time.sleep(0.03)
+                self.mouse.click(btn)
+                time.sleep(0.03)
+                send([(KEYCODE["ctrl"], 0)])
+            else:
+                self.mouse.click(btn)
         return False
 
     def _wiggle(self):
