@@ -41,6 +41,7 @@ TAP_SLOP = 26
 FREQ_W = 3.5
 IDLE_S = 20
 PILL_KEY_W = 90         # collapsed-bar key width (logical px)
+BKSP_GUARD_S = 0.6      # Enter's top half reads as Bksp this soon after one
 
 KEYCODE = {c: i for i, c in enumerate(
     ["", "esc", "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-", "=",
@@ -666,6 +667,7 @@ class Keyboard(Gtk.Window):
         self._down = False
         self._down_key = None
         self._last_commit = None
+        self._last_bksp = 0.0
         # Our own typed text since the last focus-ambiguous action (cursor
         # keys, Enter, expand, mouse mode...). The word being typed and the
         # word before it are read from its tail, so backspacing into the
@@ -1316,6 +1318,13 @@ class Keyboard(Gtk.Window):
         self._down = True
         self._path = [(ev.x, ev.y)]
         self._down_key = self._key_at(ev.x, ev.y)
+        # Enter sits right under Bksp: a backspace run drifting down onto
+        # Enter's top half stays a backspace.
+        if (self._down_key == "ENTER"
+                and time.monotonic() - self._last_bksp < BKSP_GUARD_S
+                and self._key_at(ev.x, ev.y - self.key_h / 2) == "BKSP"):
+            print("bksp guard: enter tap -> bksp", flush=True)
+            self._down_key = "BKSP"
         if self._trail_timeout:
             GLib.source_remove(self._trail_timeout)
             self._trail_timeout = None
@@ -1635,6 +1644,7 @@ class Keyboard(Gtk.Window):
     def _tap(self, code):
         self._poke()
         if code == KEYCODE["bksp"]:
+            self._last_bksp = time.monotonic()
             self._last_auto = None
             self._sh_bksp()
             if self._buf:
