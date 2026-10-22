@@ -208,6 +208,51 @@ class VirtualMouse:
         os.close(self.fd)
 
 
+class CapsSensor:
+    """Live system Caps Lock state. Mutter pushes its xkb lock state to the
+    LEDs of every keyboard in the seat (sync_leds_in_impl), including a new
+    one at creation, so a uinput keyboard with a Caps LED receives each
+    change as an EV_LED event on its own fd. It never sends a key.
+
+    The /sys/class/leds/*capslock LED is NOT usable: it belongs to the
+    built-in i8042 keyboard, which libinput suspends in tablet mode, so it
+    freezes at whatever it was when the Type Cover came off. Keys only
+    (no REL/BTN), so it can't count as a pointer and break touch-mode."""
+
+    UI_SET_EVBIT, UI_SET_KEYBIT, UI_SET_LEDBIT = 0x40045564, 0x40045565, 0x40045569
+    UI_DEV_SETUP, UI_DEV_CREATE = 0x405c5503, 0x5501
+    EVFMT = "llHHi"
+
+    def __init__(self, on_change):
+        self.on = False            # kernel LED starts at 0; no event = off
+        self._cb = on_change
+        self.fd = os.open("/dev/uinput",
+                          os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC)
+        for ev in (0, 1, 0x11):    # EV_SYN, EV_KEY, EV_LED
+            fcntl.ioctl(self.fd, self.UI_SET_EVBIT, ev)
+        for k in range(1, 84):     # main block, so udev tags it a keyboard
+            fcntl.ioctl(self.fd, self.UI_SET_KEYBIT, k)
+        fcntl.ioctl(self.fd, self.UI_SET_LEDBIT, 1)   # LED_CAPSL
+        fcntl.ioctl(self.fd, self.UI_DEV_SETUP, struct.pack(
+            "HHHH80sI", 0x06, 0x2333, 0x6668, 1, b"touchkbd caps sensor", 0))
+        fcntl.ioctl(self.fd, self.UI_DEV_CREATE)
+        GLib.io_add_watch(self.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN,
+                          self._read)
+
+    def _read(self, _fd, _cond):
+        sz = struct.calcsize(self.EVFMT)
+        try:
+            data = os.read(self.fd, sz * 64)
+        except BlockingIOError:
+            return True
+        for i in range(0, len(data) - sz + 1, sz):
+            _, _, t, c, v = struct.unpack(self.EVFMT, data[i:i + sz])
+            if t == 0x11 and c == 1 and bool(v) != self.on:
+                self.on = bool(v)
+                self._cb(self.on)
+        return True
+
+
 def send(codes):
     INJ.send(codes)
 
@@ -653,13 +698,15 @@ class Keyboard(Gtk.Window):
         self.key_h = 48
         self._screen = "letters"
         self._shift = 0
-        # System Caps Lock (separate from our Shift lock). Read from the
-        # kernel LED: GDK's keymap state never updates for an unfocused
-        # Xwayland dock, but mutter mirrors xkb lock state to the LEDs.
-        self._caps_led = next(iter(glob.glob(
-            "/sys/class/leds/*capslock/brightness")), None)
+        # System Caps Lock (separate from our Shift lock). GDK's keymap
+        # state never updates for an unfocused Xwayland dock, so read it
+        # from mutter's LED push to our own sensor keyboard (CapsSensor).
         self._sys_caps = False
-        GLib.timeout_add(500, self._poll_caps)
+        try:
+            self._caps_sensor = CapsSensor(self._caps_changed)
+        except OSError as e:
+            self._caps_sensor = None
+            sys.stderr.write("caps sensor: /dev/uinput failed: %s\n" % e)
         self._timer = None
         self._idle_timer = None
         self._trail_timeout = None
@@ -1412,9 +1459,8 @@ class Keyboard(Gtk.Window):
             if self._sys_caps:
                 # Tap on the red CAPS badge releases the system Caps Lock
                 # (a real keycode-58 press); our own Shift state is untouched.
+                # The sensor reports the real result; no optimistic clear.
                 send([(KEY_CAPSLOCK, 1), (KEY_CAPSLOCK, 0)])
-                self._sys_caps = False
-                self.canvas.queue_draw()
             else:
                 self._set_shift((self._shift + 1) % 3)
         elif kid == "BKSP":
@@ -1473,14 +1519,7 @@ class Keyboard(Gtk.Window):
 
     # ----- tap-typing prediction / autocorrect -----
 
-    def _poll_caps(self):
-        on = False
-        if self._caps_led:
-            try:
-                with open(self._caps_led) as f:
-                    on = f.read().strip() == "1"
-            except OSError:
-                pass
+    def _caps_changed(self, on):
         if on != self._sys_caps:
             self._sys_caps = on
             sys.stderr.write("%s system caps lock %s\n" % (
