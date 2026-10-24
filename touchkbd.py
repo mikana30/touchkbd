@@ -729,6 +729,7 @@ HALLUCINATIONS = re.compile(
 # clip; dropped only as the LAST sentence of the final chunk (and logged).
 TRAILING_THANKS = re.compile(
     r"(thanks|thank you)( so| very)?( much)?( for (that|this))?[.!]?", re.I)
+LOW_CONF = 0.4          # short sentences below this are dropped as invented
 CLIPS = os.path.expanduser("~/.local/share/touchkbd/clips")
 KEEP_CLIPS = 10
 
@@ -2436,6 +2437,16 @@ class Keyboard(Gtk.Window):
             for x in segs:
                 print("mic:   seg %.1f-%.1f p=%s %r" % (
                     x[0], x[1], x[3] if len(x) > 3 else "?", x[2]), flush=True)
+            # Invented filler scores far below real speech (10/24: "Good
+            # day." p=0.17/0.32 vs your sentence p=0.88).
+            kept = []
+            for x in segs:
+                if len(x) > 3 and x[3] < LOW_CONF and len(x[2].split()) <= 3:
+                    print("mic: dropped low-confidence %r p=%s" % (x[2], x[3]),
+                          flush=True)
+                else:
+                    kept.append(x)
+            segs = kept
             if final and segs and TRAILING_THANKS.fullmatch(segs[-1][2].strip()):
                 print("mic: dropped trailing %r (Whisper end-of-clip "
                       "hallucination)" % segs[-1][2], flush=True)
