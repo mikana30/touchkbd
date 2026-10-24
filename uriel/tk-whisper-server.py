@@ -6,7 +6,7 @@ uriel in ~1s. Tailnet only: binds to uriel's tailscale address.
 
 POST /transcribe   body = raw s16le 16 kHz mono PCM
   headers: X-Prompt (percent-encoded initial prompt), X-Beam (int)
-  -> {"text": "...", "segments": [[start_s, end_s, sentence], ...], "ms": 812}
+  -> {"text": "...", "segments": [[start_s, end_s, sentence, mean_word_prob], ...], "ms": 812}
 GET /health -> {"ok": true, "model": "base.en"}
 """
 import json, os, re, threading, time, urllib.parse
@@ -52,7 +52,8 @@ def sentences(segs):
     if cur:
         out.append(cur)
     return [[round(ws[0].start, 2), round(ws[-1].end, 2),
-             "".join(w.word for w in ws).strip()] for ws in out]
+             "".join(w.word for w in ws).strip(),
+             round(sum(w.probability for w in ws) / len(ws), 2)] for ws in out]
 
 
 class H(BaseHTTPRequestHandler):

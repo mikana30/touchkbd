@@ -725,6 +725,14 @@ HALLUCINATIONS = re.compile(
     r"|captions? by|transcribed by|amara\.org", re.I)
 
 
+# Whisper also invents a bare "Thank you." in the silence at the end of a
+# clip; dropped only as the LAST sentence of the final chunk (and logged).
+TRAILING_THANKS = re.compile(
+    r"(thanks|thank you)( so| very)?( much)?( for (that|this))?[.!]?", re.I)
+CLIPS = os.path.expanduser("~/.local/share/touchkbd/clips")
+KEEP_CLIPS = 10
+
+
 def drop_hallucinations(sents):
     return [s for s in sents if not HALLUCINATIONS.search(s[2])]
 
@@ -742,7 +750,8 @@ def whisper_sentences(segs):
     if cur:
         out.append(cur)
     return [[round(ws[0].start, 2), round(ws[-1].end, 2),
-             "".join(w.word for w in ws).strip()] for ws in out]
+             "".join(w.word for w in ws).strip(),
+             round(sum(w.probability for w in ws) / len(ws), 2)] for ws in out]
 
 
 
@@ -2424,6 +2433,13 @@ class Keyboard(Gtk.Window):
             # Mid chunk: type all but the last sentence and re-hear that one
             # with the audio after it, so a cut mid-sentence doesn't type
             # "voice to text. Typing because".
+            for x in segs:
+                print("mic:   seg %.1f-%.1f p=%s %r" % (
+                    x[0], x[1], x[3] if len(x) > 3 else "?", x[2]), flush=True)
+            if final and segs and TRAILING_THANKS.fullmatch(segs[-1][2].strip()):
+                print("mic: dropped trailing %r (Whisper end-of-clip "
+                      "hallucination)" % segs[-1][2], flush=True)
+                segs = segs[:-1]
             keep_all = final or cut - done >= CHUNK_MAX_S * SR
             if not keep_all and len(segs) >= 2 and segs[-1][0] > 0.5:
                 new_done = done + int(segs[-1][0] * SR)
@@ -2448,13 +2464,19 @@ class Keyboard(Gtk.Window):
         if t_stop is not None:
             print("mic: stop->done %.1fs" % (time.monotonic() - t_stop),
                   flush=True)
-        try:                                     # keep the last clip around
+        try:                    # keep the last KEEP_CLIPS clips for debugging
             import wave
-            with wave.open(MIC_WAV, "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(SR)
-                w.writeframes(a.tobytes())
+            os.makedirs(CLIPS, exist_ok=True)
+            path = os.path.join(CLIPS, time.strftime("mic-%Y%m%d-%H%M%S.wav"))
+            for out in (MIC_WAV, path):
+                with wave.open(out, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(SR)
+                    w.writeframes(a.tobytes())
+            for old in sorted(glob.glob(os.path.join(CLIPS, "mic-*.wav")))[:-KEEP_CLIPS]:
+                os.remove(old)
+            print("mic: saved %s" % path, flush=True)
         except Exception as e:
             print("mic: wav save failed: %r" % e, flush=True)
         GLib.idle_add(self._mic_done)
