@@ -716,6 +716,19 @@ def load_whisper():
 _REMOTE_DOWN_UNTIL = [0.0]
 
 
+# Whisper invents these from silence or noise (YouTube-subtitle training
+# data). A sentence matching one is dropped.
+HALLUCINATIONS = re.compile(
+    r"thanks? (you )?(so |very )?much for watching|thanks? (you )?for watching"
+    r"|see you (guys )?(in the )?next (video|time|one)|like and subscribe"
+    r"|please subscribe|don't forget to subscribe|subtitles? by"
+    r"|captions? by|transcribed by|amara\.org", re.I)
+
+
+def drop_hallucinations(sents):
+    return [s for s in sents if not HALLUCINATIONS.search(s[2])]
+
+
 def whisper_sentences(segs):
     """Whisper segments (with .words) -> [[start, end, text]] per sentence,
     split after words ending in . ? or !"""
@@ -751,7 +764,7 @@ def transcribe_pcm(pcm, prompt, beam):
                 d = json.load(r)
             if "segments" not in d:
                 raise ValueError("old server: %r" % d)
-            return [tuple(x) for x in d["segments"]], "uriel"
+            return drop_hallucinations([tuple(x) for x in d["segments"]]), "uriel"
         except Exception as e:
             print("mic: uriel failed (%r), using local" % e, flush=True)
             _REMOTE_DOWN_UNTIL[0] = time.monotonic() + 60
@@ -759,7 +772,7 @@ def transcribe_pcm(pcm, prompt, beam):
         pcm.astype(np.float32) / 32768.0, beam_size=beam, language="en",
         condition_on_previous_text=False, vad_filter=True,
         temperature=0.0, initial_prompt=prompt, word_timestamps=True)
-    return [tuple(x) for x in whisper_sentences(segs)], "local"
+    return [tuple(x) for x in drop_hallucinations(whisper_sentences(segs))], "local"
 
 
 _TOKEN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|[.!?\n]")

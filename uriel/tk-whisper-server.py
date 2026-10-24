@@ -9,7 +9,7 @@ POST /transcribe   body = raw s16le 16 kHz mono PCM
   -> {"text": "...", "segments": [[start_s, end_s, sentence], ...], "ms": 812}
 GET /health -> {"ok": true, "model": "base.en"}
 """
-import json, os, threading, time, urllib.parse
+import json, os, re, threading, time, urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
@@ -24,6 +24,19 @@ MAX_BYTES = 16000 * 2 * 120                          # 2 minutes
 model = WhisperModel(MODEL, device="cpu", compute_type="int8",
                      cpu_threads=THREADS)
 lock = threading.Lock()
+
+
+# Whisper invents these from silence or noise (YouTube-subtitle training
+# data). A sentence matching one is dropped.
+HALLUCINATIONS = re.compile(
+    r"thanks? (you )?(so |very )?much for watching|thanks? (you )?for watching"
+    r"|see you (guys )?(in the )?next (video|time|one)|like and subscribe"
+    r"|please subscribe|don't forget to subscribe|subtitles? by"
+    r"|captions? by|transcribed by|amara\.org", re.I)
+
+
+def drop_hallucinations(sents):
+    return [s for s in sents if not HALLUCINATIONS.search(s[2])]
 
 
 def sentences(segs):
@@ -76,7 +89,7 @@ class H(BaseHTTPRequestHandler):
                     condition_on_previous_text=False,
                     temperature=0.0, initial_prompt=prompt,
                     word_timestamps=True)
-                segs = sentences(segs)
+                segs = drop_hallucinations(sentences(segs))
                 text = " ".join(s[2] for s in segs).strip()
         except Exception as e:
             return self._json(500, {"error": repr(e)})
