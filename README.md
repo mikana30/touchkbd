@@ -30,10 +30,23 @@ keys go, and every toolkit, terminal, and browser just works.
   into terminals, where "correcting" `grep` would be unforgivable).
   Autocorrects are shown in the suggestion bar; tap the original to revert
   *and* learn it.
-- **Speech-to-text** — a 🎤 key records the mic (PipeWire `pw-record`) and
-  transcribes locally with [faster-whisper](https://github.com/SYSTRAN/faster-whisper)
-  `base.en` int8. Fully offline, usable even on a Pentium-class tablet
-  (~realtime transcription; first use loads the model for a few seconds).
+- **Phrase prediction** — the suggestion bar's first slots offer whole
+  phrases. `→` is learned from your own writing (`--seed-phrases` builds
+  `phrases.json` from past Claude Code prompts and dictations; it keeps
+  learning from what you type and dictate, real-word runs only). `✦` is
+  Claude Haiku finishing the sentence, through one long-running
+  `claude -p` process (Claude Code login / Max plan, no API key; ~1.5s per
+  suggestion). Only text made entirely of dictionary words is sent, so
+  passwords never leave. Each request carries your 4 closest past sentences
+  (`sentences.txt`, grows as you type/dictate) so it matches your wording:
+  on a 40-sentence test that doubled first-word hits (9 -> 17) at no speed cost.
+- **Speech-to-text** — a 🎤 key streams the mic (PipeWire `pw-record --raw`)
+  to [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `base.en`.
+  Text is typed in sentence-sized chunks while you talk; each chunk's last
+  sentence is re-heard with the following audio so cuts never land
+  mid-sentence. Transcription goes to `uriel/tk-whisper-server.py` (a
+  faster machine on the tailnet, ~1s) and falls back to the local CPU
+  (~5s per chunk on a Pentium 4415Y) when that's unreachable.
 - **Three screens** (letters / ?123 / #+=), Gboard-ish layout, and a
   utility row: esc, tab, delete, page up/down, arrows, hide.
 - **Terminal-friendly details** — on-screen Shift applies to tab/enter/

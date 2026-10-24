@@ -14,17 +14,21 @@ are never corrected. Learns from use (usage.json: counts of dictionary
 words, word pairs, undone corrections). Backspace right after an
 autocorrect reverts it for good; tap "+ word" in the bar to teach a new
 word. ?123 -> Fn has F1-F12 and Home/End/Ins/PgUp/PgDn.
+Whole-phrase suggestions: learned phrases (phrases.json) plus optional
+Claude Haiku sentence completion (claude -p, Max plan). Dictation streams to Whisper on uriel
+(local fallback) and types sentence by sentence while you talk.
 On-screen Shift also applies to tab/enter/arrows (shift+tab cycles Claude
 Code permission modes). Collapses to a bottom-edge pill with scroll keys;
 auto-collapses after 20s idle.
 """
 import bisect, ctypes, ctypes.util, fcntl, glob, json, math, os, socket, struct
-import subprocess, sys, threading, time
+import re, subprocess, sys, threading, time
 os.environ["GDK_BACKEND"] = "x11"
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("GdkX11", "3.0")
-from gi.repository import Gtk, Gdk, GdkX11, GLib
+gi.require_version("Pango", "1.0")
+from gi.repository import Gtk, Gdk, GdkX11, GLib, Pango
 
 SOCKET = os.environ.get("YDOTOOL_SOCKET",
                         "/run/user/%d/.ydotool_socket" % os.getuid())
@@ -63,6 +67,23 @@ SHIFTABLE = {KEYCODE[k] for k in
 AUTOCORRECT_MAX = 1.55
 MIC_WAV = os.path.expanduser("~/.local/share/touchkbd/mic.wav")
 _WHISPER = None
+_WHISPER_LOCK = threading.Lock()
+WHISPER_PROMPT = ("Claude Code terminal commands on a Fedora Surface Go "
+                  "tablet: keyboard, touchscreen, mouse pointer, copy, paste, "
+                  "drag, select.")
+SR = 16000
+# Whisper pays a fixed ~4.5s per chunk on this CPU (it always encodes a 30s
+# window), so chunks stay long and are cut only at a real pause.
+CHUNK_MIN_S = 10.0      # live dictation: cut a chunk at a pause after this
+CHUNK_MAX_S = 22.0      # ...or at the quietest spot once it gets this long
+# uriel runs the same model ~5x faster (uriel/tk-whisper-server.py, tailnet
+# only); the Go's own CPU is the fallback.
+REMOTE_WHISPER = os.environ.get("TOUCHKBD_WHISPER_URL",
+                                "http://100.116.82.95:8791/transcribe")
+PHRASES = os.path.expanduser("~/.local/share/touchkbd/phrases.json")
+SENTENCES = os.path.expanduser("~/.local/share/touchkbd/sentences.txt")
+AI_EXAMPLES = 4         # your closest past sentences sent with each request
+AI_DELAY_MS = 450       # pause after a word before asking Haiku
 
 # char -> (keyname, shifted)
 CHARS = {}
@@ -677,6 +698,363 @@ class Predictor:
         return scored[:4]
 
 
+def load_whisper():
+    """The Whisper model, loaded once (startup preload or first use)."""
+    global _WHISPER
+    with _WHISPER_LOCK:
+        if _WHISPER is None:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")  # model is cached
+            from faster_whisper import WhisperModel
+            t = time.monotonic()
+            _WHISPER = WhisperModel("base.en", device="cpu",
+                                    compute_type="int8", cpu_threads=4)
+            print("mic: whisper loaded in %.1fs" % (time.monotonic() - t),
+                  flush=True)
+        return _WHISPER
+
+
+_REMOTE_DOWN_UNTIL = [0.0]
+
+
+def whisper_sentences(segs):
+    """Whisper segments (with .words) -> [[start, end, text]] per sentence,
+    split after words ending in . ? or !"""
+    out, cur = [], []
+    for s in segs:
+        for w in (s.words or []):
+            cur.append(w)
+            if w.word.strip().endswith((".", "?", "!")):
+                out.append(cur)
+                cur = []
+    if cur:
+        out.append(cur)
+    return [[round(ws[0].start, 2), round(ws[-1].end, 2),
+             "".join(w.word for w in ws).strip()] for ws in out]
+
+
+
+def transcribe_pcm(pcm, prompt, beam):
+    """Segments [(start_s, end_s, text)] for s16 mono PCM: uriel first,
+    the local model if uriel is unreachable (then uriel is skipped for a
+    minute). -> (segments, where)"""
+    import urllib.parse, urllib.request
+    import numpy as np
+    if REMOTE_WHISPER and time.monotonic() >= _REMOTE_DOWN_UNTIL[0]:
+        try:
+            req = urllib.request.Request(
+                REMOTE_WHISPER, data=pcm.tobytes(), method="POST",
+                headers={"X-Prompt": urllib.parse.quote(prompt or ""),
+                         "X-Beam": str(beam),
+                         "Content-Type": "application/octet-stream"})
+            tmo = 3.0 + 0.3 * len(pcm) / SR
+            with urllib.request.urlopen(req, timeout=tmo) as r:
+                d = json.load(r)
+            if "segments" not in d:
+                raise ValueError("old server: %r" % d)
+            return [tuple(x) for x in d["segments"]], "uriel"
+        except Exception as e:
+            print("mic: uriel failed (%r), using local" % e, flush=True)
+            _REMOTE_DOWN_UNTIL[0] = time.monotonic() + 60
+    segs, _i = load_whisper().transcribe(
+        pcm.astype(np.float32) / 32768.0, beam_size=beam, language="en",
+        condition_on_previous_text=False, vad_filter=True,
+        temperature=0.0, initial_prompt=prompt, word_timestamps=True)
+    return [tuple(x) for x in whisper_sentences(segs)], "local"
+
+
+_TOKEN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?|[.!?\n]")
+
+
+def sentence_words(text):
+    """Lowercased words of the sentence still in progress at the end of
+    text, after a "<s>" start marker."""
+    words = ["<s>"]
+    for t in _TOKEN.findall(text):
+        if t in ".!?\n":
+            words = ["<s>"]
+        else:
+            words.append(t.lower())
+    return words
+
+
+class Phrases:
+    """Whole-phrase prediction from your own writing: counts of which word
+    follows each 1-3 word context. Only runs of real words are stored
+    (same password rule as Usage). Seeded from past Claude Code prompts
+    (--seed-phrases), then learns from what you type and dictate."""
+
+    MAX_CTX = 3
+
+    def __init__(self, path=PHRASES):
+        self.path = path
+        self.next = {}
+        try:
+            with open(path) as f:
+                self.next = json.load(f).get("next", {})
+        except (OSError, ValueError):
+            pass
+        self.dirty = False
+
+    def _add(self, ctx, w, n=1):
+        d = self.next.setdefault(" ".join(ctx), {})
+        d[w] = d.get(w, 0) + n
+        self.dirty = True
+
+    def learn_last(self, words):
+        """Count the last word of a sentence-so-far against its contexts."""
+        if len(words) < 2:
+            return
+        w = words[-1]
+        for n in range(1, self.MAX_CTX + 1):
+            if len(words) - 1 >= n:
+                self._add(words[-1 - n:-1], w)
+
+    def learn_seq(self, words):
+        for i in range(2, len(words) + 1):
+            self.learn_last(words[:i])
+
+    def _best(self, ctx, prefix="", min_n=1):
+        """Most likely next word after ctx (optionally starting with
+        prefix), trying the longest context first. Confident picks only."""
+        for n in range(min(self.MAX_CTX, len(ctx)), min_n - 1, -1):
+            d = self.next.get(" ".join(ctx[-n:]))
+            if not d:
+                continue
+            cands = [(c, w) for w, c in d.items() if w.startswith(prefix)]
+            if not cands:
+                continue
+            tot = sum(c for c, _w in cands)
+            c, w = max(cands)
+            if c >= 2 and c / tot >= (0.3 if n >= 2 else 0.45):
+                return w
+        return None
+
+    def predict(self, ctx, partial="", first=None, max_words=7):
+        """Words continuing ctx. partial = the word being typed (the first
+        predicted word completes it); first = fallback for that word."""
+        words = []
+        w = self._best(ctx, partial.lower()) or first
+        if not w:
+            return []
+        words.append(w)
+        while len(words) < max_words:
+            w = self._best(ctx + words, min_n=2)
+            if not w:
+                break
+            words.append(w)
+            if len(words) >= 4 and words[-2:] == words[-4:-2]:
+                words = words[:-2]       # stop a repeating loop
+                break
+        return words if len(words) >= 2 else []
+
+    def save(self):
+        if not self.dirty:
+            return
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"next": self.next}, f)
+        os.replace(tmp, self.path)
+        self.dirty = False
+
+
+class SentenceBank:
+    """Your own past sentences (Claude prompts, typing, dictation), so
+    Haiku can be shown how you phrase things. Lookup is a small IDF-weighted
+    word match, a few ms. Same password rule: real-word sentences only."""
+
+    STOP = set("the a an and or to of in on it is i you we that this for "
+               "with be so do can just".split())
+
+    def __init__(self, path=SENTENCES):
+        self.path = path
+        self.sents, self.index, self.seen = [], {}, set()
+        try:
+            with open(path) as f:
+                for line in f:
+                    self._index(line.strip())
+        except OSError:
+            pass
+
+    @staticmethod
+    def _words(s):
+        return [w.lower() for w in _TOKEN.findall(s) if w not in ".!?\n"]
+
+    def _index(self, s):
+        key = " ".join(self._words(s))
+        if not s or key in self.seen:
+            return False
+        self.seen.add(key)
+        i = len(self.sents)
+        self.sents.append(s)
+        for w in set(self._words(s)):
+            self.index.setdefault(w, []).append(i)
+        return True
+
+    def add(self, s):
+        s = " ".join(s.split())
+        if len(self._words(s)) >= 4 and self._index(s):
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "a") as f:
+                f.write(s + "\n")
+
+    def search(self, words, k=AI_EXAMPLES, exclude=None):
+        """Best-matching past sentences for the words typed so far. Words
+        near the cursor count more, and so does a matching last word pair."""
+        words = [w for w in words if w != "<s>"]
+        if not words or not self.sents:
+            return []
+        n = len(self.sents)
+        score = {}
+        for pos, w in enumerate(words):
+            ids = self.index.get(w)
+            if not ids:
+                continue
+            idf = math.log(1 + n / len(ids))
+            if w in self.STOP:
+                idf *= 0.3
+            recency = 1.0 + pos / len(words)       # 1..2, cursor end heavier
+            for i in ids:
+                score[i] = score.get(i, 0.0) + idf * recency
+        if len(words) >= 2:
+            pair = " ".join(words[-2:])
+            for i in list(score):
+                if pair in " ".join(self._words(self.sents[i])):
+                    score[i] *= 1.5
+        best = sorted(score, key=lambda i: -score[i])
+        out = []
+        for i in best:
+            s = self.sents[i]
+            if exclude and exclude(s):
+                continue
+            out.append(s)
+            if len(out) >= k:
+                break
+        return out
+
+
+class AIPhraser:
+    """Claude Haiku sentence completion through the Claude Code CLI (Max
+    plan, no API key). One `claude -p` process stays open and takes
+    stream-json requests: ~1.5s each vs ~4-6s for a fresh CLI. Recycled
+    every RECYCLE requests (stale context) and closed after IDLE_S idle.
+    Only text made of real words is ever sent (no passwords)."""
+
+    RECYCLE = 15
+    IDLE_S = 300
+    SYSTEM = ("You are the autocomplete on a phone-style on-screen keyboard. "
+              "The user is Mike, usually writing instructions to Claude Code "
+              "or messages. Each user message is text being typed; messages "
+              "are unrelated to each other. Reply with ONLY the words most "
+              "likely to come next, to finish that sentence (at most 10 "
+              "words, may end with punctuation). Never repeat the text "
+              "already typed. No quotes, no commentary, no leading dots. "
+              "Messages may include examples of Mike's own past sentences: "
+              "use them to match his wording and habits, but only where "
+              "they fit the text being typed.")
+
+    def __init__(self):
+        self.bin = GLib.find_program_in_path("claude") or os.path.expanduser(
+            "~/.local/bin/claude")
+        self.proc, self.turns, self.last = None, 0, 0.0
+        self.lock = threading.Lock()
+        print("ai: %s" % ("on (claude -p haiku)" if self.enabled
+                          else "off (no claude CLI)"), flush=True)
+        GLib.timeout_add_seconds(60, self._idle_check)
+
+    @property
+    def enabled(self):
+        return os.path.exists(self.bin)
+
+    def _start(self):
+        env = dict(os.environ)
+        env.pop("CLAUDECODE", None)
+        self.proc = subprocess.Popen(
+            # no tools/MCP/skills/settings: ~570 input tokens. Effort medium:
+            # low was 0.7s faster but often answered one word ("the", "a")
+            [self.bin, "-p", "--model", "haiku", "--effort", "medium",
+             "--tools", "",
+             "--strict-mcp-config", "--disable-slash-commands",
+             "--no-session-persistence", "--setting-sources", "",
+             "--input-format", "stream-json",
+             "--output-format", "stream-json", "--verbose",
+             "--system-prompt", self.SYSTEM],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env,
+            cwd=self._cwd())
+        self.turns = 0
+
+    @staticmethod
+    def _cwd():
+        """An empty folder, so the session loads no project memory or
+        CLAUDE.md (from ~ it pulled in session notes and slowed down)."""
+        d = os.path.expanduser("~/.local/share/touchkbd/ai-session")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _stop(self):
+        if self.proc:
+            try:
+                self.proc.kill()
+                self.proc.wait(2)
+            except Exception:
+                pass
+            self.proc = None
+
+    def _idle_check(self):
+        if self.proc and time.monotonic() - self.last > self.IDLE_S \
+                and self.lock.acquire(blocking=False):
+            try:
+                self._stop()
+            finally:
+                self.lock.release()
+        return True
+
+    def complete(self, text, is_current=lambda: True, examples=()):
+        """Continuation text, or "" if stale/failed. Blocking; one request
+        at a time, and requests gone stale while waiting are skipped."""
+        with self.lock:
+            if not is_current():
+                return ""
+            self.last = time.monotonic()
+            try:
+                if self.proc is None or self.proc.poll() is not None \
+                        or self.turns >= self.RECYCLE:
+                    self._stop()
+                    self._start()
+                t = time.monotonic()
+                msg = text
+                if examples:
+                    msg = ("Mike's past sentences:\n" +
+                           "\n".join("- " + e for e in examples) +
+                           "\n\nText so far: " + text)
+                self.proc.stdin.write(json.dumps(
+                    {"type": "user",
+                     "message": {"role": "user", "content": msg}}) + "\n")
+                self.proc.stdin.flush()
+                self.turns += 1
+                out = None
+                while out is None:
+                    line = self.proc.stdout.readline()
+                    if not line:
+                        raise OSError("claude exited")
+                    try:
+                        d = json.loads(line)
+                    except ValueError:
+                        continue
+                    if d.get("type") == "result":
+                        out = d.get("result") or ""
+                out = out.strip().splitlines()[0] if out.strip() else ""
+                out = out.strip(' "').lstrip(".\u2026 ")
+                print("ai: %.2fs %r -> %r" % (time.monotonic() - t,
+                                               text[-40:], out), flush=True)
+                return out[:90]
+            except Exception as e:
+                print("ai: failed: %r" % e, flush=True)
+                self._stop()
+                return ""
+
+
 class Keyboard(Gtk.Window):
     def __init__(self):
         super().__init__(type=Gtk.WindowType.TOPLEVEL)
@@ -725,6 +1103,18 @@ class Keyboard(Gtk.Window):
         self._sugg_action = None
         self._rec_proc = None
         self._transcribing = False
+        self._relaunch_pending = False
+        self._pcm = bytearray()         # live dictation audio (s16 mono)
+        self._pcm_lock = threading.Lock()
+        self._phrases_shown = []        # [(source, remainder)] in the bar
+        self._ai_timer = None
+        self._ai_seq = 0
+        self._ai_hit = None             # (shadow when asked, continuation)
+        # A rotation relaunch mid-recording used to orphan pw-record, which
+        # kept appending to mic.wav for hours (98s decode for a 25s clip).
+        subprocess.run(["pkill", "-f", "^pw-record .*touchkbd"],
+                       stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._preload_whisper, daemon=True).start()
         self.mouse = None
         self._pad_last = None
         self._pad_seq = None
@@ -745,6 +1135,9 @@ class Keyboard(Gtk.Window):
         self.decoder = Decoder(self.centers)
         self.usage = Usage()
         self.predictor = Predictor(self.centers, self.key_w, self.usage)
+        self.phrases = Phrases()
+        self.bank = SentenceBank()
+        self.ai = AIPhraser()
         self.canvas_h = 4 * self.key_h
 
         self.stack = Gtk.Stack()
@@ -767,6 +1160,7 @@ class Keyboard(Gtk.Window):
         button.pill { min-height: 30px; font-size: 14px;
                       background: rgba(44,44,54,0.9); }
         button.rec { background: #a03030; }
+        button.phrase { background: rgba(40,48,70,1); color: #cfe0ff; }
         """)
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -788,7 +1182,14 @@ class Keyboard(Gtk.Window):
             print("rotation: %dx%d -> %dx%d, relaunching" %
                   (self.mon.width, self.mon.height, mon.width, mon.height),
                   flush=True)
-            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+            if self._rec_proc is not None or self._transcribing:
+                self._relaunch_pending = True   # after the dictation lands
+                return
+            self._relaunch()
+
+    def _relaunch(self):
+        self._save_usage()
+        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
 
     def _compute_layout(self, name):
         keys = []
@@ -824,6 +1225,17 @@ class Keyboard(Gtk.Window):
         # every keystroke.
         self.sugg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.sugg_box.set_size_request(-1, 40)
+        # Phrase slots (local learned phrase, then Haiku) come first and
+        # take the extra width; the word slots shrink to 2 while they show.
+        self._phrase_btns = []
+        for _ in range(2):
+            b = Gtk.Button()
+            b.get_style_context().add_class("sugg")
+            b.get_style_context().add_class("phrase")
+            b.set_no_show_all(True)
+            b.connect("clicked", self._on_phrase)
+            self._phrase_btns.append(b)
+            self.sugg_box.pack_start(b, True, True, 0)
         self._sugg_btns = []
         for _ in range(5):
             b = Gtk.Button()
@@ -1309,10 +1721,25 @@ class Keyboard(Gtk.Window):
             b.connect("clicked", cb)
         return b
 
-    def _set_suggestions(self, words, action=None, mark=None, add=None):
+    def _set_suggestions(self, words, action=None, mark=None, add=None,
+                         phrases=()):
         """mark = the word now in the text; add = unknown word a tap
-        will teach."""
+        will teach; phrases = [(source, text to type)] for the phrase slots."""
         self._sugg_action = action or self._replace_last
+        self._phrases_shown = list(phrases)[:2]
+        buf = self._buf
+        for b, ph in zip(self._phrase_btns, self._phrases_shown):
+            b._phrase = ph
+            b.set_label(("\u2726 " if ph[0] == "ai" else "\u2192 ")
+                        + buf + ph[1])
+            lbl = b.get_child()
+            if isinstance(lbl, Gtk.Label):
+                lbl.set_ellipsize(Pango.EllipsizeMode.END)
+            b.show()
+        for b in self._phrase_btns[len(self._phrases_shown):]:
+            b.hide()
+        if self._phrases_shown:
+            words = words[:2]
         for b, w in zip(self._sugg_btns, words):
             b._word = w
             b.set_label(("\u2713 " + w) if w == mark else
@@ -1320,6 +1747,33 @@ class Keyboard(Gtk.Window):
             b.show()
         for b in self._sugg_btns[len(words):]:
             b.hide()
+
+    def _on_phrase(self, b):
+        """Type the rest of the phrase, then count its words as typed."""
+        self._poke()
+        src, rest = b._phrase
+        text = rest.rstrip() + " "
+        type_text(text)
+        self._last_auto = None
+        start = len(self._shadow) - len(self._buf)
+        self._sh_add(text)
+        print("phrase(%s): %r" % (src, text), flush=True)
+        tail = self._shadow[max(0, start):]
+        prev = self._prev_word_before(start)
+        last = None
+        for m in _TOKEN.finditer(tail):
+            t = m.group()
+            if t in ".!?\n":
+                prev = None
+                continue
+            self._note(t, prev, upto=max(0, start) + m.end())
+            prev, last = t.lower(), t
+        self._last_commit = (last.lower(), False, None) if last else None
+        self._show_next()
+
+    def _prev_word_before(self, i):
+        ws = sentence_words(self._shadow[:i])
+        return ws[-1] if len(ws) > 1 else None
 
     def _on_sugg(self, b):
         self._poke()
@@ -1478,6 +1932,9 @@ class Keyboard(Gtk.Window):
             force = self._screen == "letters" and bool(self._shift)
             send(char_codes(kid, force_shift=force))
             self._sh_add(kid.upper() if force else kid)
+            if kid in ".!?":
+                self._bank_sentence(re.split(r"[.!?\n]",
+                                             self._shadow[:-1])[-1] + kid)
             if self._buf:
                 self._update_typing()
             else:
@@ -1573,10 +2030,11 @@ class Keyboard(Gtk.Window):
                                               []).append((word, 300))
             print("learned: %s" % word, flush=True)
 
-    def _note(self, word, prev):
+    def _note(self, word, prev, upto=None):
         """Count a committed word (and the pair) toward ranking. Only real
         words: random strings (passwords) never get stored."""
         word = word.lower()
+        self._learn_phrase(word, upto)
         if not word.isalpha() or not self.predictor.valid(word):
             return
         if not self.predictor.knows(word):
@@ -1587,10 +2045,25 @@ class Keyboard(Gtk.Window):
         if not self._save_timer:
             self._save_timer = GLib.timeout_add_seconds(15, self._save_usage)
 
+    def _learn_phrase(self, word, upto=None):
+        """Feed the sentence ending in this word to the phrase model, if
+        every word in its context window is a real word."""
+        ws = sentence_words(self._shadow[:upto] if upto else self._shadow)
+        if len(ws) < 2 or not ws[-1].endswith(word):
+            return
+        win = ws[-(Phrases.MAX_CTX + 1):]
+        if all(w == "<s>" or self.predictor.valid(w.replace("'", ""))
+               or self.predictor.valid(w) for w in win):
+            self.phrases.learn_last(win)
+            if not self._save_timer:
+                self._save_timer = GLib.timeout_add_seconds(15,
+                                                            self._save_usage)
+
     def _save_usage(self):
         self._save_timer = None
         try:
             self.usage.save()
+            self.phrases.save()
         except OSError as e:
             print("usage save failed: %s" % e, flush=True)
         return False
@@ -1601,14 +2074,91 @@ class Keyboard(Gtk.Window):
         return False
 
     def _update_typing(self):
-        self._set_suggestions(
-            self.predictor.complete(self._buf.lower(), self._prev_word()),
-            action=self._commit_typed)
+        words = self.predictor.complete(self._buf.lower(), self._prev_word())
+        self._set_suggestions(words, action=self._commit_typed,
+                              phrases=self._phrase_cands(words))
 
     def _show_next(self):
         """After a word + space: what you usually type next."""
         nxt = self.predictor.next_words(self._prev_word())
-        self._set_suggestions(nxt, action=self._commit_typed)
+        self._set_suggestions(nxt, action=self._commit_typed,
+                              phrases=self._phrase_cands(nxt))
+        self._ai_schedule()
+
+    def _phrase_cands(self, words):
+        """[(source, text to type after the cursor)] for the phrase slots:
+        the learned phrase, plus Haiku's if it still fits what's typed."""
+        buf = self._buf
+        ctx = sentence_words(self._shadow[:len(self._shadow) - len(buf)])
+        out = []
+        ph = self.phrases.predict(ctx, buf,
+                                  first=words[0] if words and buf else None)
+        if ph:
+            rest = ph[0][len(buf):] + " " + " ".join(ph[1:])
+            out.append(("local", rest))
+        if self._ai_hit:
+            asked, cont = self._ai_hit
+            if self._shadow.startswith(asked):
+                extra = self._shadow[len(asked):]
+                if cont.lower().startswith(extra.lower()) and \
+                        len(cont) > len(extra) + 1:
+                    rest = cont[len(extra):]
+                    if not out or out[0][1].strip() != rest.strip():
+                        out.append(("ai", rest))
+            else:
+                self._ai_hit = None
+        return out
+
+    def _ai_schedule(self):
+        """After a word boundary, ask Haiku (debounced) to finish the
+        sentence. Sent only if the sentence so far is all real words."""
+        if self._ai_timer:
+            GLib.source_remove(self._ai_timer)
+            self._ai_timer = None
+        if not self.ai.enabled or not self._shadow.endswith(" "):
+            return
+        sent = re.split(r"(?<=[.!?\n])\s*", self._shadow)[-1]
+        toks = re.findall(r"\S+", sent)
+        if len(toks) < 2:
+            return
+        for t in toks:
+            w = t.strip(".,!?;:\"()").lower()
+            if not w or not re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w) or not (
+                    self.predictor.valid(w) or
+                    self.predictor.valid(w.replace("'", ""))):
+                return
+        self._ai_seq += 1
+        seq, asked = self._ai_seq, self._shadow
+        self._ai_timer = GLib.timeout_add(
+            AI_DELAY_MS, self._ai_fire, seq, asked)
+
+    def _ai_fire(self, seq, asked):
+        self._ai_timer = None
+        ctx = asked[-300:].lstrip()
+
+        ex = self.bank.search(sentence_words(asked))
+
+        def work():
+            cont = self.ai.complete(ctx, lambda: seq == self._ai_seq, ex)
+            GLib.idle_add(self._ai_done, seq, asked, cont)
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def _ai_done(self, seq, asked, cont):
+        cont = cont.lstrip()
+        if seq != self._ai_seq or not cont or \
+                not self._shadow.startswith(asked):
+            return False
+        self._ai_hit = (asked, cont)
+        # refresh the bar only if it's showing typing/next-word suggestions
+        if self._sugg_action == self._commit_typed:
+            if self._buf:
+                self._update_typing()
+            else:
+                nxt = self.predictor.next_words(self._prev_word())
+                self._set_suggestions(nxt, action=self._commit_typed,
+                                      phrases=self._phrase_cands(nxt))
+        return False
 
     def _commit_typed(self, word):
         buf, prev = self._buf, self._prev_word()
@@ -1717,6 +2267,8 @@ class Keyboard(Gtk.Window):
         else:
             if code == KEYCODE["enter"] and self._buf:
                 self._note(self._buf, self._prev_word())
+            if code == KEYCODE["enter"]:
+                self._bank_sentence(re.split(r"[.!?\n]", self._shadow)[-1])
             self._reset_word()
         if self._shift and code in SHIFTABLE:
             send([(SHIFT, 1), (code, 1), (code, 0), (SHIFT, 0)])
@@ -1746,18 +2298,39 @@ class Keyboard(Gtk.Window):
 
     # ----- speech to text -----
 
+    def _preload_whisper(self):
+        time.sleep(8)                   # let the keyboard come up first
+        try:
+            load_whisper()
+        except Exception as e:
+            print("mic: preload failed: %r" % e, flush=True)
+
     def _mic_toggle(self, _b):
+        """Live dictation: pw-record streams raw audio to us; a worker
+        transcribes each pause-delimited chunk while you keep talking and
+        types it right away, so stop only waits on the last few seconds."""
         self._poke()
         if self._rec_proc is None and not self._transcribing:
-            os.makedirs(os.path.dirname(MIC_WAV), exist_ok=True)
+            with self._pcm_lock:
+                self._pcm = bytearray()
             try:
+                # "touchkbd" in argv lets startup reap an orphan by name
                 self._rec_proc = subprocess.Popen(
-                    ["pw-record", "--rate", "16000", "--channels", "1",
-                     MIC_WAV])
+                    ["pw-record", "--rate", str(SR), "--channels", "1",
+                     "--format", "s16", "--raw",
+                     "-P", '{ node.name = "touchkbd-dictation" }', "-"],
+                    stdout=subprocess.PIPE)       # stderr -> touchkbd.log
             except OSError as e:
                 print("mic: pw-record failed: %s" % e, flush=True)
                 return
-            self._set_mic_label("◉ stop", rec=True)
+            self._transcribing = True
+            self._dict_typed = []
+            rd = threading.Thread(target=self._mic_reader,
+                                  args=(self._rec_proc,), daemon=True)
+            rd.start()
+            threading.Thread(target=self._mic_worker,
+                             args=(self._rec_proc, rd), daemon=True).start()
+            self._set_mic_label("\u25c9 stop", rec=True)
             # don't auto-collapse mid-recording: the stop button would vanish
             if self._idle_timer:
                 GLib.source_remove(self._idle_timer)
@@ -1765,47 +2338,166 @@ class Keyboard(Gtk.Window):
         elif self._rec_proc is not None:
             p, self._rec_proc = self._rec_proc, None
             p.terminate()
-            try:
-                p.wait(2)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                p.wait()
-            self._transcribing = True
-            self._set_mic_label("…")
-            threading.Thread(target=self._transcribe, daemon=True).start()
+            self._set_mic_label("\u2026")
 
-    def _transcribe(self):
-        global _WHISPER
-        text = ""
+    def _mic_reader(self, proc):
+        while True:
+            data = proc.stdout.read(3200)       # 0.1 s
+            if not data:
+                break
+            with self._pcm_lock:
+                self._pcm += data
         try:
-            if _WHISPER is None:
-                os.environ.setdefault("HF_HUB_OFFLINE", "1")  # model is cached
-                from faster_whisper import WhisperModel
-                _WHISPER = WhisperModel("base.en", device="cpu",
-                                        compute_type="int8", cpu_threads=4)
-            segs, _info = _WHISPER.transcribe(
-                MIC_WAV, beam_size=5, language="en",
-                condition_on_previous_text=False,
-                initial_prompt="Claude Code terminal commands on a Fedora "
-                               "Surface Go tablet: keyboard, touchscreen, "
-                               "mouse pointer, copy, paste, drag, select.")
-            text = "".join(s.text for s in segs).strip()
-        except Exception as e:
-            print("mic: transcribe failed: %r" % e, flush=True)
-        GLib.idle_add(self._mic_done, text)
+            proc.wait(2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
-    def _mic_done(self, text):
+    @staticmethod
+    def _cut_point(a, start, lo, hi):
+        """Sample index of the quietest 0.3 s window in a[lo:hi], and its
+        loudness relative to the median of the chunk a[start:hi]."""
+        import numpy as np
+        f = 800                                  # 50 ms frames
+        n = (hi - start) // f
+        if n < 12:
+            return hi, 1.0
+        fr = a[start:start + n * f].reshape(n, f).astype(np.float32)
+        rms = np.sqrt((fr ** 2).mean(axis=1)) + 1.0
+        win = np.convolve(rms, np.ones(6) / 6, mode="valid")
+        first = max(0, (lo - start) // f)
+        if first >= len(win):
+            return hi, 1.0
+        i = first + int(win[first:].argmin())
+        return start + (i + 3) * f, float(win[i] / np.median(rms))
+
+    def _mic_worker(self, proc, reader):
+        import numpy as np
+        done = 0                                 # samples already typed
+        prompt = WHISPER_PROMPT
+        t_stop = None
+        need = CHUNK_MIN_S * SR         # audio to gather before a mid chunk
+        while True:
+            finished = not reader.is_alive()
+            with self._pcm_lock:
+                a = np.frombuffer(bytes(self._pcm), dtype=np.int16)
+            avail = len(a) - done
+            if finished:
+                if t_stop is None:
+                    t_stop = time.monotonic()
+                with self._pcm_lock:
+                    a = np.frombuffer(bytes(self._pcm), dtype=np.int16)
+                cut, final = len(a), True
+            elif avail >= need:
+                lo = done + int((need / SR - 2.5) * SR)
+                cut, q = self._cut_point(a, done, lo, len(a))
+                if q > 0.25 and avail < CHUNK_MAX_S * SR:
+                    time.sleep(0.3)              # no pause yet; keep listening
+                    continue
+                final = False
+            else:
+                time.sleep(0.2)
+                continue
+            text, segs = "", []
+            t, where = time.monotonic(), "-"
+            if cut - done > SR * 0.3:
+                # local final chunk: greedy decode saves ~0.7s after stop
+                beam = 1 if final and time.monotonic() < \
+                    _REMOTE_DOWN_UNTIL[0] else 5
+                try:
+                    segs, where = transcribe_pcm(a[done:cut], prompt, beam)
+                except Exception as e:
+                    print("mic: transcribe failed: %r" % e, flush=True)
+            # Mid chunk: type all but the last sentence and re-hear that one
+            # with the audio after it, so a cut mid-sentence doesn't type
+            # "voice to text. Typing because".
+            keep_all = final or cut - done >= CHUNK_MAX_S * SR
+            if not keep_all and len(segs) >= 2 and segs[-1][0] > 0.5:
+                new_done = done + int(segs[-1][0] * SR)
+                segs = segs[:-1]
+            elif keep_all or not segs:
+                new_done = cut
+            else:                       # one unfinished sentence: wait
+                new_done = done
+                need = cut - done + 3 * SR
+                segs = []
+            text = " ".join(x[2] for x in segs if x[2]).strip()
+            print("mic: chunk %.1fs audio -> %.1fs %s%s %r" % (
+                (cut - done) / SR, time.monotonic() - t, where,
+                " (final)" if final else "", text), flush=True)
+            if new_done != done:
+                done, need = new_done, CHUNK_MIN_S * SR
+            if text:
+                prompt = (WHISPER_PROMPT + " " + text)[-400:]
+                GLib.idle_add(self._mic_type, text)
+            if final:
+                break
+        if t_stop is not None:
+            print("mic: stop->done %.1fs" % (time.monotonic() - t_stop),
+                  flush=True)
+        try:                                     # keep the last clip around
+            import wave
+            with wave.open(MIC_WAV, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SR)
+                w.writeframes(a.tobytes())
+        except Exception as e:
+            print("mic: wav save failed: %r" % e, flush=True)
+        GLib.idle_add(self._mic_done)
+
+    def _bank_sentence(self, text):
+        """Keep a finished sentence of yours for Haiku's examples, only if
+        every word is a real word (passwords never get stored)."""
+        text = text.strip()
+        ws = SentenceBank._words(text)
+        if len(ws) >= 4 and all(self.predictor.valid(w) or
+                                self.predictor.valid(w.replace("'", ""))
+                                for w in ws):
+            self.bank.add(text)
+
+    def _mic_type(self, text):
+        print("mic: %r" % text, flush=True)
+        type_text(text + " ")
+        self._last_auto = None
+        self._sh_add(text + " ")
+        self._dict_typed.append(text)
+        for sent in re.split(r"(?<=[.!?])\s+", text):
+            self._bank_sentence(sent)
+        return False
+
+    def _mic_done(self):
         self._transcribing = False
-        self._set_mic_label("🎤")
-        if text:
-            print("mic: %r" % text, flush=True)
-            type_text(text + " ")
-            self._last_auto = None
-            self._sh_add(text + " ")
-            self._set_suggestions([])
+        self._set_mic_label("\U0001f3a4")
+        if self._dict_typed:
+            # learn your phrasing from dictation (real-word runs only)
+            for sent in re.split(r"(?<=[.!?])\s+", " ".join(self._dict_typed)):
+                run = ["<s>"]
+                for t in _TOKEN.findall(sent):
+                    w = t.lower()
+                    if w in ".!?\n":
+                        continue
+                    if self.predictor.valid(w) or \
+                            self.predictor.valid(w.replace("'", "")):
+                        run.append(w)
+                    else:
+                        self.phrases.learn_seq(run)
+                        run = []
+                self.phrases.learn_seq(run)
+            self.phrases.dirty = True
+            if not self._save_timer:
+                self._save_timer = GLib.timeout_add_seconds(15,
+                                                            self._save_usage)
+            self._show_next()
         else:
-            self._set_suggestions(["(no speech)"], action=lambda _w: None)
+            with self._pcm_lock:
+                got = len(self._pcm)
+            self._set_suggestions(["(no speech)" if got else
+                                   "(mic failed, see touchkbd.log)"],
+                                  action=lambda _w: None)
         self._poke()
+        if self._relaunch_pending:
+            self._relaunch()
         return False
 
     def _press_repeat(self, _b, code):
@@ -1936,7 +2628,70 @@ def selftest():
     print("%d/%d top-1" % (ok, len(tests)))
 
 
+def seed_phrases():
+    """Build phrases.json from your own past writing: Claude Code prompts
+    typed on this machine plus logged dictations. Real-word runs only."""
+    pred = Predictor({}, 1.0, Usage())
+    texts = []
+    for f in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+        with open(f, errors="ignore") as fh:
+            for line in fh:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "user" or d.get("isMeta"):
+                    continue
+                c = d.get("message", {}).get("content")
+                if isinstance(c, str) and not c.startswith("<") \
+                        and len(c) < 2000:
+                    texts.append(c)
+    try:
+        log = subprocess.run(["journalctl", "--user", "-o", "cat",
+                              "-t", "touchkbd.desktop"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        log = ""
+    for m in re.finditer(r"^mic: ['\"](.*)['\"]$", log, re.M):
+        texts.append(m.group(1))
+    ph = Phrases()
+    ph.next, n = {}, 0
+    texts = list(dict.fromkeys(t.strip() for t in texts))  # resumed sessions repeat prompts
+    for t in texts:
+        for sent in re.split(r"(?<=[.!?\n])\s*", t):
+            run = ["<s>"]
+            for tok in _TOKEN.findall(sent):
+                w = tok.lower()
+                if w in ".!?\n":
+                    continue
+                if pred.valid(w) or pred.valid(w.replace("'", "")):
+                    run.append(w)
+                    n += 1
+                else:
+                    ph.learn_seq(run)
+                    run = []
+            ph.learn_seq(run)
+    ph.dirty = True
+    ph.save()
+    bank, nb = SentenceBank(), 0
+    for t in texts:
+        for sent in re.split(r"(?<=[.!?])\s+|\n+", t):
+            ws = SentenceBank._words(sent)
+            if len(ws) >= 4 and all(pred.valid(w) or
+                                    pred.valid(w.replace("'", "")) for w in ws):
+                n0 = len(bank.sents)
+                bank.add(sent)
+                nb += len(bank.sents) - n0
+    print("sentence bank: +%d (%d total) -> %s" % (nb, len(bank.sents),
+                                                   SENTENCES))
+    print("seeded %d texts, %d words, %d contexts -> %s"
+          % (len(texts), n, len(ph.next), PHRASES))
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--seed-phrases":
+        seed_phrases()
+        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         selftest()
         sys.exit(0)

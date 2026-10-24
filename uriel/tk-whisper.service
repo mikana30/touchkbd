@@ -1,0 +1,12 @@
+[Unit]
+Description=Whisper transcription for the Surface Go keyboard (touchkbd)
+After=network-online.target tailscaled.service
+
+[Service]
+Environment=HF_HUB_OFFLINE=1
+ExecStart=%h/whisper-venv/bin/python -I %h/tk-whisper/tk-whisper-server.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
