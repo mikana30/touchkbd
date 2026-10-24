@@ -68,9 +68,13 @@ AUTOCORRECT_MAX = 1.55
 MIC_WAV = os.path.expanduser("~/.local/share/touchkbd/mic.wav")
 _WHISPER = None
 _WHISPER_LOCK = threading.Lock()
-WHISPER_PROMPT = ("Claude Code terminal commands on a Fedora Surface Go "
-                  "tablet: keyboard, touchscreen, mouse pointer, copy, paste, "
-                  "drag, select.")
+# A plain punctuated sentence: Whisper copies its punctuation (sentence ends
+# are what live chunks split on). 10/24: the old vocabulary prompt ("Claude
+# Code terminal commands...") set off repetition loops ("It's not a bad
+# story." x6, 4.8s on uriel -> timeout -> 33s locally) and "Good day." filler;
+# no prompt lost sentence breaks; "Hello, how are you?..." invented a line.
+# This one was clean on all 7 saved clips.
+WHISPER_PROMPT = "Okay. Here is what I need, please."
 SR = 16000
 # Whisper pays a fixed ~4.5s per chunk on this CPU (it always encodes a 30s
 # window), so chunks stay long and are cut only at a real pause.
@@ -769,7 +773,7 @@ def transcribe_pcm(pcm, prompt, beam):
                 headers={"X-Prompt": urllib.parse.quote(prompt or ""),
                          "X-Beam": str(beam),
                          "Content-Type": "application/octet-stream"})
-            tmo = 3.0 + 0.3 * len(pcm) / SR
+            tmo = 5.0 + 0.5 * len(pcm) / SR     # the local fallback is ~5x slower
             with urllib.request.urlopen(req, timeout=tmo) as r:
                 d = json.load(r)
             if "segments" not in d:
@@ -781,7 +785,8 @@ def transcribe_pcm(pcm, prompt, beam):
     segs, _i = load_whisper().transcribe(
         pcm.astype(np.float32) / 32768.0, beam_size=beam, language="en",
         condition_on_previous_text=False, vad_filter=True,
-        temperature=0.0, initial_prompt=prompt, word_timestamps=True)
+        temperature=0.0, initial_prompt=prompt or None, word_timestamps=True,
+        repetition_penalty=1.2)
     return [tuple(x) for x in drop_hallucinations(whisper_sentences(segs))], "local"
 
 
@@ -2447,6 +2452,19 @@ class Keyboard(Gtk.Window):
                 else:
                     kept.append(x)
             segs = kept
+            # Impossibly fast (6 words in 0.1s) or back-to-back repeats are a
+            # decoding loop, not speech.
+            kept = []
+            for x in segs:
+                nw = len(x[2].split())
+                if nw >= 2 and nw / max(x[1] - x[0], 0.05) > 8:
+                    print("mic: dropped too-fast %r (%d words in %.1fs)" % (
+                        x[2], nw, x[1] - x[0]), flush=True)
+                elif kept and x[2].strip().lower() == kept[-1][2].strip().lower():
+                    print("mic: dropped repeat %r" % x[2], flush=True)
+                else:
+                    kept.append(x)
+            segs = kept
             if final and segs and TRAILING_THANKS.fullmatch(segs[-1][2].strip()):
                 print("mic: dropped trailing %r (Whisper end-of-clip "
                       "hallucination)" % segs[-1][2], flush=True)
@@ -2468,7 +2486,7 @@ class Keyboard(Gtk.Window):
             if new_done != done:
                 done, need = new_done, CHUNK_MIN_S * SR
             if text:
-                prompt = (WHISPER_PROMPT + " " + text)[-400:]
+                prompt = WHISPER_PROMPT
                 GLib.idle_add(self._mic_type, text)
             if final:
                 break

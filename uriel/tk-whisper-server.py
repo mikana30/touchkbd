@@ -89,7 +89,9 @@ class H(BaseHTTPRequestHandler):
                     audio, language="en", beam_size=beam, vad_filter=True,
                     condition_on_previous_text=False,
                     temperature=0.0, initial_prompt=prompt,
-                    word_timestamps=True)
+                    word_timestamps=True,
+                    # 10/24: blocks "come on guys, come on guys..." loops
+                    repetition_penalty=1.2)
                 segs = drop_hallucinations(sentences(segs))
                 text = " ".join(s[2] for s in segs).strip()
         except Exception as e:
