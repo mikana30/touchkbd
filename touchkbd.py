@@ -65,6 +65,8 @@ SHIFTABLE = {KEYCODE[k] for k in
              ("tab", "enter", "up", "down", "left", "right", "delete",
               "home", "end")}
 AUTOCORRECT_MAX = 1.55
+FUZZY_K = 2.5           # a slip in a prefix ranks like a ~300x rarer word
+LETTERS = "abcdefghijklmnopqrstuvwxyz"
 MIC_WAV = os.path.expanduser("~/.local/share/touchkbd/mic.wav")
 _WHISPER = None
 _WHISPER_LOCK = threading.Lock()
@@ -642,13 +644,66 @@ class Predictor:
     def _score(self, w, prev):
         return math.log10(self.rank[w] + 10) - self.bonus(w, prev)
 
-    def complete(self, prefix, prev=None, n=5):
-        if not prefix:
-            return []
+    def _starting(self, prefix):
         lo = bisect.bisect_left(self.sorted_words, prefix)
         hi = bisect.bisect_left(self.sorted_words, prefix + "￿")
-        return sorted(self.sorted_words[lo:hi],
-                      key=lambda w: self._score(w, prev))[:n]
+        return self.sorted_words[lo:hi]
+
+    def _variants(self, p):
+        """{prefix: typo cost} for prefixes one slip away from p: a
+        neighbouring key hit, two letters swapped, a key missed, an extra
+        key. A word starting with one of them may be what you meant."""
+        out = {}
+
+        def add(v, c):
+            if v and v != p and c < out.get(v, 9):
+                out[v] = c
+        n = len(p)
+        for i in range(n):
+            for ch in LETTERS:
+                if ch != p[i] and self._adjacent(p[i], ch):
+                    add(p[:i] + ch + p[i + 1:], 0.5)        # neighbour key
+                # missed key before p[i]; a dropped double letter is cheapest
+                add(p[:i] + ch + p[i:],
+                    0.4 if ch == p[i] or (i and ch == p[i - 1]) else 0.7)
+            if i < n - 1 and p[i] != p[i + 1]:
+                add(p[:i] + p[i + 1] + p[i] + p[i + 2:], 0.6)   # swapped
+            if n >= 4:
+                add(p[:i] + p[i + 1:], 0.7)                 # extra key
+        return out
+
+    def complete(self, prefix, prev=None, n=5):
+        """Completions of prefix, plus words you probably meant if the
+        prefix has a slip in it (each slip costs like a much rarer word)."""
+        if not prefix:
+            return []
+        cost = dict.fromkeys(self._starting(prefix), 0.0)
+        if len(prefix) >= 2 and prefix.isalpha():
+            for v, c in self._variants(prefix).items():
+                for w in self._starting(v):
+                    if c < cost.get(w, 9):
+                        cost[w] = c
+        never = self.usage.never.get(prefix, ())
+        return sorted((w for w in cost if w not in never),
+                      key=lambda w: self._score(w, prev) +
+                      FUZZY_K * cost[w])[:n]
+
+    def near_prefix(self, typed, word):
+        """word starts with typed, or with a one-slip variant of it."""
+        typed = typed.lower()
+        return word.startswith(typed) or any(
+            word.startswith(v) for v in self._variants(typed))
+
+    def fix(self, w):
+        """w for context lookups: as typed if it's a word, else its clear
+        one-edit correction (same bar as autocorrect), else as typed."""
+        if not w or len(w) < 3 or not w.isalpha() or self.valid(w):
+            return w
+        c = self.correct(w)
+        if c and c[0][0] <= AUTOCORRECT_MAX and (
+                len(c) == 1 or c[1][0] - c[0][0] >= 0.20):
+            return c[0][1]
+        return w
 
     def next_words(self, prev, n=5):
         nxt = self.usage.bigrams.get(prev or "", {})
@@ -848,7 +903,9 @@ class Phrases:
             d = self.next.get(" ".join(ctx[-n:]))
             if not d:
                 continue
-            cands = [(c, w) for w, c in d.items() if w.startswith(prefix)]
+            ok = prefix if callable(prefix) else \
+                (lambda w, p=prefix: w.startswith(p))
+            cands = [(c, w) for w, c in d.items() if ok(w)]
             if not cands:
                 continue
             tot = sum(c for c, _w in cands)
@@ -857,11 +914,14 @@ class Phrases:
                 return w
         return None
 
-    def predict(self, ctx, partial="", first=None, max_words=7):
+    def predict(self, ctx, partial="", first=None, max_words=7, alts=()):
         """Words continuing ctx. partial = the word being typed (the first
-        predicted word completes it); first = fallback for that word."""
+        predicted word completes it); alts = what partial may have meant
+        if it has a slip in it; first = fallback for that word."""
         words = []
-        w = self._best(ctx, partial.lower()) or first
+        alts = set(alts)
+        w = self._best(ctx, partial.lower()) or \
+            (alts and self._best(ctx, alts.__contains__)) or first
         if not w:
             return []
         words.append(w)
@@ -1134,7 +1194,7 @@ class Keyboard(Gtk.Window):
         self._relaunch_pending = False
         self._pcm = bytearray()         # live dictation audio (s16 mono)
         self._pcm_lock = threading.Lock()
-        self._phrases_shown = []        # [(source, remainder)] in the bar
+        self._phrases_shown = []        # [(source, text, n bksp)] in the bar
         self._ai_timer = None
         self._ai_seq = 0
         self._ai_hit = None             # (shadow when asked, continuation)
@@ -1759,7 +1819,7 @@ class Keyboard(Gtk.Window):
         for b, ph in zip(self._phrase_btns, self._phrases_shown):
             b._phrase = ph
             b.set_label(("\u2726 " if ph[0] == "ai" else "\u2192 ")
-                        + buf + ph[1])
+                        + buf[:len(buf) - ph[2]] + ph[1])
             lbl = b.get_child()
             if isinstance(lbl, Gtk.Label):
                 lbl.set_ellipsize(Pango.EllipsizeMode.END)
@@ -1779,11 +1839,14 @@ class Keyboard(Gtk.Window):
     def _on_phrase(self, b):
         """Type the rest of the phrase, then count its words as typed."""
         self._poke()
-        src, rest = b._phrase
+        src, rest, back = b._phrase
         text = rest.rstrip() + " "
+        start = len(self._shadow) - len(self._buf)
+        if back:                    # the word being typed had a slip
+            send([(KEYCODE["bksp"], s) for _ in range(back) for s in (1, 0)])
+            self._sh_bksp(back)
         type_text(text)
         self._last_auto = None
-        start = len(self._shadow) - len(self._buf)
         self._sh_add(text)
         print("phrase(%s): %r" % (src, text), flush=True)
         tail = self._shadow[max(0, start):]
@@ -1914,7 +1977,7 @@ class Keyboard(Gtk.Window):
             self._path = []
         elif (self._screen == "letters" and key0 and
               len(key0) == 1 and key0.isalpha()):
-            prev = self._prev_word()
+            prev = self._ctx_prev()
             words = self.decoder.decode(
                 path, self.key_w,
                 bonus=lambda w: self.predictor.bonus(w, prev))
@@ -2067,6 +2130,7 @@ class Keyboard(Gtk.Window):
             return
         if not self.predictor.knows(word):
             self._learn(word)           # hunspell-valid but not in list
+        prev = self.predictor.fix(prev)     # a clear typo counts as its word
         if prev and not self.predictor.knows(prev):
             prev = None                 # never store an unknown word as context
         self.usage.note(word, prev)
@@ -2079,7 +2143,7 @@ class Keyboard(Gtk.Window):
         ws = sentence_words(self._shadow[:upto] if upto else self._shadow)
         if len(ws) < 2 or not ws[-1].endswith(word):
             return
-        win = ws[-(Phrases.MAX_CTX + 1):]
+        win = [self.predictor.fix(w) for w in ws[-(Phrases.MAX_CTX + 1):]]
         if all(w == "<s>" or self.predictor.valid(w.replace("'", ""))
                or self.predictor.valid(w) for w in win):
             self.phrases.learn_last(win)
@@ -2101,14 +2165,18 @@ class Keyboard(Gtk.Window):
         Gtk.main_quit()
         return False
 
+    def _ctx_prev(self):
+        """Previous word for lookups, with a clear typo fixed."""
+        return self.predictor.fix(self._prev_word())
+
     def _update_typing(self):
-        words = self.predictor.complete(self._buf.lower(), self._prev_word())
+        words = self.predictor.complete(self._buf.lower(), self._ctx_prev())
         self._set_suggestions(words, action=self._commit_typed,
                               phrases=self._phrase_cands(words))
 
     def _show_next(self):
         """After a word + space: what you usually type next."""
-        nxt = self.predictor.next_words(self._prev_word())
+        nxt = self.predictor.next_words(self._ctx_prev())
         self._set_suggestions(nxt, action=self._commit_typed,
                               phrases=self._phrase_cands(nxt))
         self._ai_schedule()
@@ -2117,22 +2185,43 @@ class Keyboard(Gtk.Window):
         """[(source, text to type after the cursor)] for the phrase slots:
         the learned phrase, plus Haiku's if it still fits what's typed."""
         buf = self._buf
-        ctx = sentence_words(self._shadow[:len(self._shadow) - len(buf)])
+        fix = self.predictor.fix
+        ctx = [fix(w) for w in
+               sentence_words(self._shadow[:len(self._shadow) - len(buf)])]
         out = []
-        ph = self.phrases.predict(ctx, buf,
+        ph = self.phrases.predict(ctx, buf, alts=words if buf else (),
                                   first=words[0] if words and buf else None)
         if ph:
-            rest = ph[0][len(buf):] + " " + " ".join(ph[1:])
-            out.append(("local", rest))
+            tail = " " + " ".join(ph[1:])
+            if ph[0].startswith(buf.lower()):
+                out.append(("local", ph[0][len(buf):] + tail, 0))
+            else:                   # buf has a slip: retype the whole word
+                w = ph[0].capitalize() if buf[:1].isupper() else ph[0]
+                out.append(("local", w + tail, len(buf)))
         if self._ai_hit:
             asked, cont = self._ai_hit
             if self._shadow.startswith(asked):
                 extra = self._shadow[len(asked):]
-                if cont.lower().startswith(extra.lower()) and \
-                        len(cont) > len(extra) + 1:
-                    rest = cont[len(extra):]
-                    if not out or out[0][1].strip() != rest.strip():
-                        out.append(("ai", rest))
+                hit = None
+                if cont.lower().startswith(extra.lower()):
+                    hit = (cont[len(extra):], 0)
+                else:
+                    # typed with slips: same words once typos are fixed?
+                    dw = re.findall(r"[A-Za-z']+",
+                                    extra[:len(extra) - len(buf)])
+                    cw = list(re.finditer(r"[A-Za-z']+", cont))
+                    if len(cw) > len(dw) and all(
+                            self.predictor.fix(d.lower()) == c.group().lower()
+                            for d, c in zip(dw, cw)) and (
+                            not buf or self.predictor.near_prefix(
+                                buf, cw[len(dw)].group().lower())):
+                        rest = cont[cw[len(dw)].start():]
+                        if buf[:1].isupper():
+                            rest = rest[:1].upper() + rest[1:]
+                        hit = (rest, len(buf))
+                if hit and len(hit[0]) > 1:
+                    if not out or out[0][1].strip() != hit[0].strip():
+                        out.append(("ai",) + hit)
             else:
                 self._ai_hit = None
         return out
@@ -2149,22 +2238,29 @@ class Keyboard(Gtk.Window):
         toks = re.findall(r"\S+", sent)
         if len(toks) < 2:
             return
+        fixed = []
         for t in toks:
             w = t.strip(".,!?;:\"()").lower()
-            if not w or not re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w) or not (
-                    self.predictor.valid(w) or
-                    self.predictor.valid(w.replace("'", ""))):
+            if not w or not re.fullmatch(r"[a-z]+(?:'[a-z]+)?", w):
                 return
+            if not (self.predictor.valid(w) or
+                    self.predictor.valid(w.replace("'", ""))):
+                c = self.predictor.fix(w)
+                if c == w:          # not a clear typo: could be a password
+                    return
+                t = t.replace(t.strip(".,!?;:\"()"), c, 1)
+            fixed.append(t)
         self._ai_seq += 1
         seq, asked = self._ai_seq, self._shadow
+        clean = asked[:len(asked) - len(sent)] + " ".join(fixed) + " "
         self._ai_timer = GLib.timeout_add(
-            AI_DELAY_MS, self._ai_fire, seq, asked)
+            AI_DELAY_MS, self._ai_fire, seq, asked, clean)
 
-    def _ai_fire(self, seq, asked):
+    def _ai_fire(self, seq, asked, clean):
         self._ai_timer = None
-        ctx = asked[-300:].lstrip()
+        ctx = clean[-300:].lstrip()
 
-        ex = self.bank.search(sentence_words(asked))
+        ex = self.bank.search(sentence_words(clean))
 
         def work():
             cont = self.ai.complete(ctx, lambda: seq == self._ai_seq, ex)
@@ -2183,7 +2279,7 @@ class Keyboard(Gtk.Window):
             if self._buf:
                 self._update_typing()
             else:
-                nxt = self.predictor.next_words(self._prev_word())
+                nxt = self.predictor.next_words(self._ctx_prev())
                 self._set_suggestions(nxt, action=self._commit_typed,
                                       phrases=self._phrase_cands(nxt))
         return False
