@@ -1328,7 +1328,8 @@ class Keyboard(Gtk.Window):
         self.sugg_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         self.sugg_box.set_size_request(-1, 40)
         # Phrase slots (local learned phrase, then Haiku) come first and
-        # take the extra width; the word slots shrink to 2 while they show.
+        # take the extra width; all 5 word slots stay, at natural width,
+        # while they show (2 slots cost ~10 points of keystroke savings).
         self._phrase_btns = []
         for _ in range(2):
             b = Gtk.Button()
@@ -1840,8 +1841,9 @@ class Keyboard(Gtk.Window):
             b.show()
         for b in self._phrase_btns[len(self._phrases_shown):]:
             b.hide()
-        if self._phrases_shown:
-            words = words[:2]
+        for b in self._sugg_btns:
+            self.sugg_box.child_set_property(b, "expand",
+                                             not self._phrases_shown)
         for b, w in zip(self._sugg_btns, words):
             b._word = w
             b.set_label(("\u2713 " + w) if w == mark else
