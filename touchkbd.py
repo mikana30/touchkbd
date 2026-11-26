@@ -34,6 +34,10 @@ SOCKET = os.environ.get("YDOTOOL_SOCKET",
                         "/run/user/%d/.ydotool_socket" % os.getuid())
 WORDS = os.path.expanduser("~/.local/share/touchkbd/words.txt")
 USER_WORDS = os.path.expanduser("~/.local/share/touchkbd/user-words.txt")
+# words kept only because you undid an autocorrect: known (never corrected
+# again) but ranked near the bottom, so a one-off typo can't crowd the bar
+KEPT_WORDS = os.path.expanduser("~/.local/share/touchkbd/kept-words.txt")
+KEPT_RANK = 30000
 USAGE = os.path.expanduser("~/.local/share/touchkbd/usage.json")
 SWIPE_MAX_RANK = 10000  # swipe DTW is O(cands); tap typing uses the full list
 SHADOW_MAX = 400        # chars of our own typed text kept for context
@@ -602,6 +606,12 @@ class Predictor:
                     w = line.strip()
                     if w and w not in self.rank:
                         self.rank[w] = r
+        if os.path.exists(KEPT_WORDS):
+            with open(KEPT_WORDS) as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if len(w) >= 2 and w.isalpha() and w not in self.rank:
+                        self.rank[w] = KEPT_RANK
         self.sorted_words = sorted(self.rank)
         self.del1 = {}
         for w in self.rank:
@@ -619,17 +629,21 @@ class Predictor:
         """A real word: in our lexicon or accepted by hunspell."""
         return w in self.rank or self.speller.ok(w)
 
-    def learn(self, w):
+    def learn(self, w, kept=False):
+        """Add w to the lexicon. kept=True: only an undone autocorrect, so
+        it goes in at the bottom (often an accidental backspace, not a word)."""
         w = w.lower()
         if not w.isalpha() or len(w) < 2 or w in self.rank:
             return False
-        self.rank[w] = 300
-        self.user.add(w)
+        self.rank[w] = KEPT_RANK if kept else 300
+        if not kept:
+            self.user.add(w)
         bisect.insort(self.sorted_words, w)
         for d in self._dels(w):
             self.del1.setdefault(d, []).append(w)
-        os.makedirs(os.path.dirname(USER_WORDS), exist_ok=True)
-        with open(USER_WORDS, "a") as f:
+        path = KEPT_WORDS if kept else USER_WORDS
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
             f.write(w + "\n")
         return True
 
@@ -2371,7 +2385,8 @@ class Keyboard(Gtk.Window):
         self._sh_add(typed[:1].upper() + typed[1:] if cap else typed)
         self.usage.reject(typed, corr)
         self.usage.note(corr, prev, n=-1)
-        self._learn(typed)
+        if self.predictor.learn(typed, kept=True):
+            print("kept: %s" % typed, flush=True)
         print("undo autocorrect: %s -> %s" % (corr, typed), flush=True)
         self._update_typing()
         return True
